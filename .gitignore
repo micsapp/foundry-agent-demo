@@ -1,0 +1,14 @@
+# Secrets and local settings
+.env
+.env.bak.*
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime state created by the app (environment-specific or regenerated on start)
+.kb_vector_store.json
+.kb_backups/
+demo_oracle_mock.db
+feedback_log.jsonl
