@@ -62,8 +62,8 @@ def run_all_tests() -> None:
     print(f"PASS: Created {len(res5.pending_approvals)} pending HITL approval actions.")
 
     for pending in res5.pending_approvals:
-        approval_msg = orch.approve_pending_action(pending.action_id)
-        print("  ->", approval_msg.splitlines()[0])
+        approval = orch.approve_pending_action(pending.action_id)
+        print("  ->", approval.reply_markdown.splitlines()[0])
 
     updated_kb = orch.kb_tool.read_kb_file("oracle_db_runbook.md")
     assert "ORA-12514: TNS:listener Does Not Currently Know of Service" in updated_kb

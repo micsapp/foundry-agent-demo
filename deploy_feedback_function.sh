@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Deploys the log_feedback Azure Function as an MCP server that the Foundry agent calls itself (this also works
-# in the Foundry portal playground). Safe to re-run: existing resources are reused and the code is redeployed.
+# Deploys the Azure Function that serves the agent's log_feedback, query_oracle_db and update_oracle_incident
+# tools as an MCP server, which Foundry calls itself (so they also work in the Foundry portal playground).
+# Safe to re-run: existing resources are reused and the code is redeployed.
 #
-#   1. Storage account + Azure Table "feedback" in the Foundry resource's resource group and region
+#   1. Storage account with the Azure Table "feedback" and the blob container "oracle-mock" (the mock Oracle
+#      database, a SQLite file the function creates on first use), in the Foundry resource's group and region
 #   2. Function App (Flex Consumption, Python) with a system-assigned managed identity
-#   3. Storage Table Data Contributor on the storage account for the Function App and for you
-#   4. Code from azure_function/ plus feedback_log.py and guardrails.py, built remotely
+#   3. For the Function App and for you: Storage Table Data Contributor on the storage account and Storage Blob
+#      Data Contributor on the oracle-mock container
+#   4. Code from azure_function/ plus feedback_log.py, oracle_tool.py and guardrails.py, built remotely
 #   5. Waits until the new build answers on /api/health
 #   6. The app's mcp_extension system key, stored in a Foundry MCP ("remote tool") connection and nowhere else
-#   7. MCP smoke test, then FEEDBACK_MCP_URL, FEEDBACK_CONNECTION_NAME, FEEDBACK_TABLE_ENDPOINT and
-#      FEEDBACK_TABLE_NAME in .env
+#   7. MCP smoke test (lists the tools, runs one read-only query), then FEEDBACK_MCP_URL,
+#      FEEDBACK_CONNECTION_NAME, FEEDBACK_TABLE_ENDPOINT, FEEDBACK_TABLE_NAME, DB_MODE=azure_blob and
+#      ORACLE_MOCK_BLOB_URL in .env
 #
 # Reads PROJECT_ENDPOINT from .env. Override names with FEEDBACK_STORAGE_ACCOUNT / FEEDBACK_FUNCTION_APP.
 # The next app start (or kb_eval.py run) creates a new agent version that uses the function.
@@ -71,12 +75,14 @@ SUFFIX=$(printf %s "$ACCOUNT_ID" | sha1sum | cut -c1-8)
 STORAGE=${FEEDBACK_STORAGE_ACCOUNT:-feedbacklog$SUFFIX}
 APP=${FEEDBACK_FUNCTION_APP:-feedback-log-$SUFFIX}
 TABLE=feedback
+DB_CONTAINER=oracle-mock
+DB_BLOB_URL="https://$STORAGE.blob.core.windows.net/$DB_CONTAINER/demo_oracle_mock.db"
 CONNECTION=feedback-mcp
 OLD_CONNECTION=feedback-function # used by the earlier OpenAPI version of this tool
 echo "Foundry: $ACCOUNT / $PROJECT   resource group: $RG   region: $LOCATION"
 echo "Storage account: $STORAGE   Function App: $APP"
 
-step "1. Storage account and table"
+step "1. Storage account, table and database container"
 if ! az storage account show -n "$STORAGE" -g "$RG" -o none 2>/dev/null; then
   az storage account create -n "$STORAGE" -g "$RG" -l "$LOCATION" --sku Standard_LRS --kind StorageV2 \
     --min-tls-version TLS1_2 --allow-blob-public-access false -o none
@@ -85,6 +91,9 @@ STORAGE_ID=$(az storage account show -n "$STORAGE" -g "$RG" --query id -o tsv)
 az rest --method put -o none --body '{}' \
   --url "https://management.azure.com$STORAGE_ID/tableServices/default/tables/$TABLE?api-version=2023-05-01"
 echo "Table $TABLE ready"
+DB_CONTAINER_ID="$STORAGE_ID/blobServices/default/containers/$DB_CONTAINER"
+az rest --method put -o none --body '{}' --url "https://management.azure.com$DB_CONTAINER_ID?api-version=2023-05-01"
+echo "Container $DB_CONTAINER ready"
 
 step "2. Function App (Flex Consumption)"
 if ! az functionapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
@@ -93,20 +102,24 @@ if ! az functionapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
 fi
 APP_PRINCIPAL=$(az functionapp identity assign -n "$APP" -g "$RG" --query principalId -o tsv)
 az functionapp config appsettings set -n "$APP" -g "$RG" -o none --settings \
-  "FEEDBACK_TABLE_ENDPOINT=https://$STORAGE.table.core.windows.net" "FEEDBACK_TABLE_NAME=$TABLE"
+  "FEEDBACK_TABLE_ENDPOINT=https://$STORAGE.table.core.windows.net" "FEEDBACK_TABLE_NAME=$TABLE" \
+  "ORACLE_MOCK_BLOB_URL=$DB_BLOB_URL"
 read -r APP_ID HOST < <(az functionapp show -n "$APP" -g "$RG" \
   --query "join(' ', [id, properties.defaultHostName || defaultHostName])" -o tsv)
 
-step "3. Table access for the Function App and for you"
+step "3. Table and database access for the Function App and for you"
+ME=$(my_object_id)
 grant "Storage Table Data Contributor" "$APP_PRINCIPAL" ServicePrincipal "$STORAGE_ID"
-grant "Storage Table Data Contributor" "$(my_object_id)" User "$STORAGE_ID"
+grant "Storage Table Data Contributor" "$ME" User "$STORAGE_ID"
+grant "Storage Blob Data Contributor" "$APP_PRINCIPAL" ServicePrincipal "$DB_CONTAINER_ID"
+grant "Storage Blob Data Contributor" "$ME" User "$DB_CONTAINER_ID"
 
 step "4. Deploy code"
 BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 mkdir "$BUILD/src"
 cp azure_function/function_app.py azure_function/host.json azure_function/requirements.txt \
-  feedback_log.py guardrails.py "$BUILD/src/"
+  feedback_log.py oracle_tool.py guardrails.py "$BUILD/src/"
 BUILD_ID=$(cat "$BUILD"/src/* | sha256sum | cut -c1-12)
 echo "$BUILD_ID" > "$BUILD/src/build_id.txt"
 (cd "$BUILD/src" && zip -qr ../function.zip .)
@@ -189,11 +202,26 @@ mcp_post '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 SESSION=$(tr -d '\r' < "$BUILD/mcp-headers" | awk -F': ' 'tolower($1) == "mcp-session-id" { print $2 }')
 mcp_post '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$SESSION" >/dev/null
 TOOLS=$(mcp_post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$SESSION")
-if grep -q '"log_feedback"' <<<"$TOOLS"; then
-  echo "MCP server lists log_feedback"
-else
-  echo "MCP tools/list didn't include log_feedback: $(head -c 400 <<<"$TOOLS")"; exit 1
-fi
+for tool in log_feedback query_oracle_db update_oracle_incident; do
+  grep -q "\"$tool\"" <<<"$TOOLS" || { echo "MCP tools/list didn't include $tool: $(head -c 400 <<<"$TOOLS")"; exit 1; }
+done
+echo "MCP server lists log_feedback, query_oracle_db and update_oracle_incident"
+QUERY='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_oracle_db","arguments":{"sql_query":"SELECT COUNT(*) AS INCIDENTS FROM SYSTEM_INCIDENTS","reason":"deploy check"}}}'
+for attempt in $(seq 1 12); do # a new role assignment can take a few minutes to reach the storage account
+  RESULT=$(mcp_post "$QUERY" "$SESSION" | "$PY" -c '
+import json, sys
+body = sys.stdin.read()
+lines = [l[5:] for l in body.splitlines() if l.startswith("data:")] or [body]  # SSE or plain JSON
+try:
+    out = json.loads(json.loads(lines[-1])["result"]["content"][0]["text"])
+    print(str(out["rows"][0]["INCIDENTS"]) + " incidents" if out.get("success") else out.get("error") or out)
+except Exception:
+    print(body[:300])')
+  [[ $RESULT == *" incidents" ]] && break
+  (( attempt < 12 )) && { echo "Query not working yet (${RESULT:0:120}); retrying..."; sleep 20; }
+done
+[[ $RESULT == *" incidents" ]] || { echo "query_oracle_db failed: $RESULT"; exit 1; }
+echo "query_oracle_db works: $RESULT in the mock database"
 NOKEY=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$MCP_URL" -H 'Content-Type: application/json' -d '{}')
 echo "Without the key: HTTP $NOKEY (expected 401)"
 cp -p .env ".env.bak.$(date +%Y%m%d-%H%M%S)"
@@ -202,4 +230,7 @@ env_set FEEDBACK_MCP_URL "$MCP_URL"
 env_set FEEDBACK_CONNECTION_NAME "$CONNECTION"
 env_set FEEDBACK_TABLE_ENDPOINT "https://$STORAGE.table.core.windows.net"
 env_set FEEDBACK_TABLE_NAME "$TABLE"
-echo "Wrote FEEDBACK_* settings to .env. The next app start creates an agent version that uses the MCP server."
+env_set DB_MODE azure_blob
+env_set ORACLE_MOCK_BLOB_URL "$DB_BLOB_URL"
+echo "Wrote FEEDBACK_*, DB_MODE and ORACLE_MOCK_BLOB_URL to .env. The next app start creates an agent version"
+echo "that uses the MCP server for log_feedback and the database tools."

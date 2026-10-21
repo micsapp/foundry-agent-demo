@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from agent_service import AgentTurnResponse, FoundryAgentOrchestrator
 from feedback_log import FEEDBACK_KINDS
+from oracle_tool import DB_FILE_PATH, seed_mock_db
 
 load_dotenv()
 
@@ -72,11 +73,16 @@ with st.sidebar:
             index=0 if orch.agent_mode == "demo" else 1,
             help="Use 'demo' for instant local testing, or 'foundry' to connect to the project at PROJECT_ENDPOINT.",
         )
+        db_modes = ["sqlite_mock", "azure_blob", "oracle_live"]
         db_mode = st.selectbox(
             "Oracle Database Mode",
-            options=["sqlite_mock", "oracle_live"],
-            index=0 if orch.oracle_tool.db_mode == "sqlite_mock" else 1,
-            help="Use 'sqlite_mock' for pre-seeded local Oracle tables, or 'oracle_live' for python-oracledb.",
+            options=db_modes,
+            index=db_modes.index(orch.oracle_tool.db_mode) if orch.oracle_tool.db_mode in db_modes else 0,
+            help=(
+                "'sqlite_mock': pre-seeded Oracle tables in a local file. 'azure_blob': the same tables in Azure "
+                "Storage, shared with the Azure Function that runs the DB tools for Foundry (also in the portal "
+                "playground). 'oracle_live': a real Oracle database through python-oracledb."
+            ),
         )
         if db_mode == "oracle_live":
             oracle_dsn = st.text_input("Oracle DSN", value=orch.oracle_tool.oracle_dsn)
@@ -89,6 +95,8 @@ with st.sidebar:
         if agent_mode != orch.agent_mode or db_mode != orch.oracle_tool.db_mode:
             orch.agent_mode = agent_mode
             orch.oracle_tool.db_mode = db_mode
+            if db_mode == "sqlite_mock":
+                seed_mock_db(DB_FILE_PATH)
             if agent_mode == "foundry":
                 orch._init_foundry_client()
 
@@ -131,9 +139,13 @@ with st.sidebar:
             st.rerun()
     with col_reset2:
         if st.button("🔄 Reset Oracle DB", width="stretch"):
-            orch.oracle_tool.reset_demo_db()
-            st.toast("Oracle demo tables restored to initial state!", icon="🗄️")
-            st.rerun()
+            try:
+                orch.oracle_tool.reset_demo_db()
+            except Exception as exc:
+                st.error(f"Couldn't reset {orch.oracle_tool.location}: `{type(exc).__name__}: {str(exc)[:200]}`")
+            else:
+                st.toast("Oracle demo tables restored to initial state!", icon="🗄️")
+                st.rerun()
 
     st.divider()
     st.subheader("📋 Guardrail Audit Log")
@@ -178,10 +190,18 @@ tab_chat, tab_db, tab_kb, tab_feedback, tab_arch = st.tabs(
 with tab_db:
     st.subheader("🗄️ Oracle Database Tables (`SYSTEM_INCIDENTS`, `DEPARTMENTS`, `EMPLOYEES`)")
     st.caption(
-        "Live view of the database tables. When you approve an incident update in the chat, "
-        "this table updates immediately."
+        f"Live view of the database tables ({orch.oracle_tool.location}). When you approve an incident update "
+        "in the chat, this table updates immediately."
+        + (
+            " Foundry runs the database tools on the Azure Function (an MCP server), which uses this same "
+            "database, so changes approved in the portal playground show up here too."
+            if orch.db_via_function
+            else ""
+        )
     )
     inc_res = orch.oracle_tool.execute_guarded_query("SELECT * FROM SYSTEM_INCIDENTS")
+    if not inc_res["success"]:
+        st.error(f"Couldn't read {orch.oracle_tool.location}: {inc_res.get('error')}")
     if inc_res["rows"]:
         st.markdown("#### `SYSTEM_INCIDENTS`")
         st.dataframe(pd.DataFrame(inc_res["rows"]), width="stretch", hide_index=True)
@@ -274,7 +294,8 @@ with tab_arch:
            - Uses Microsoft Foundry's `FileSearchTool` backed by a **Vector Store** (`vector_stores.create` + `vector_stores.files.upload_and_poll`).
            - The agent searches `oracle_db_runbook.md` and `sla_and_escalation_guide.md` to answer operational questions, and three read-only PDF product manuals for software questions.
         2. **Oracle Database Action Tool (`query_oracle_db` & `update_oracle_incident`):**
-           - Registered as `FunctionTool` / OpenAPI actions on the agent.
+           - With `DB_MODE=azure_blob` and the Azure Function deployed, both are **MCP tools** that Foundry calls on the function, so they work in the portal playground too. The mock database is a SQLite file in Azure Storage that the function and this app share. Foundry holds every `update_oracle_incident` call until someone approves it here (or in the playground's approve prompt).
+           - Otherwise they're `FunctionTool`s that this app runs.
            - **SQL Guardrail** intercepts every query before `python-oracledb` executes it: blocking `DROP`/`DELETE`/`UPDATE`, preventing multi-statement `;` injection, and enforcing table/column allowlists.
         3. **Knowledge Base Update Action Tool (`propose_kb_file_update`):**
            - Because Vector Store files are read-only to the model, updating a KB file is exposed as an **Action Tool**.
@@ -366,6 +387,11 @@ with tab_chat:
                         f"- **New Status:** `{act.arguments.get('new_status')}`\n"
                         f"- **Resolution Note:** {act.arguments.get('resolution_note')}"
                     )
+                    if act.foundry_approval_request_id:
+                        st.caption(
+                            "Foundry is holding this call. When you approve, it sends it to the Azure Function, "
+                            "which updates the shared database."
+                        )
 
                 btn_col1, btn_col2, _ = st.columns([1, 1, 3])
                 with btn_col1:
@@ -375,9 +401,9 @@ with tab_chat:
                         type="primary",
                         width="stretch",
                     ):
-                        outcome_msg = orch.approve_pending_action(act_id)
+                        outcome = orch.approve_pending_action(act_id)
                         st.session_state.messages.append(
-                            {"role": "assistant", "content": outcome_msg, "traces": []}
+                            {"role": "assistant", "content": outcome.reply_markdown, "traces": outcome.tool_traces}
                         )
                         st.rerun()
                 with btn_col2:
@@ -386,9 +412,9 @@ with tab_chat:
                         key=f"reject_{act_id}",
                         width="stretch",
                     ):
-                        outcome_msg = orch.reject_pending_action(act_id)
+                        outcome = orch.reject_pending_action(act_id)
                         st.session_state.messages.append(
-                            {"role": "assistant", "content": outcome_msg, "traces": []}
+                            {"role": "assistant", "content": outcome.reply_markdown, "traces": outcome.tool_traces}
                         )
                         st.rerun()
 

@@ -26,6 +26,7 @@ from oracle_tool import OracleDatabaseTool
 FOUNDRY_AGENT_NAME = "Oracle-And-KB-Guarded-Agent"
 KB_VECTOR_STORE_NAME = "Enterprise-Oracle-KB-Store"
 MAX_TOOL_ROUNDS = 8  # function-call round trips allowed in one user turn
+ORACLE_MCP_TOOLS = ("query_oracle_db", "update_oracle_incident")  # served by the Azure Function in azure_blob mode
 DEMO_KB_MIN_SCORE = 2.0  # demo-mode KB hits below this matched only common words
 PROBLEM_REPORT_PATTERN = re.compile(
     r"\b(report(ing)? (a|an) (problem|issue|bug)|broken|not working|(doesn't|does not|isn't|is not) working"
@@ -45,6 +46,8 @@ class PendingApprovalAction:
     foundry_response_id: Optional[str] = None
     foundry_conversation_id: Optional[str] = None
     foundry_call_id: Optional[str] = None
+    # Set for an MCP tool call that Foundry holds until the operator answers (it then calls the Azure Function)
+    foundry_approval_request_id: Optional[str] = None
 
 
 @dataclass
@@ -197,6 +200,26 @@ def feedback_mcp_tool(server_url: str, connection_name: str) -> Any:
     )
 
 
+def oracle_mcp_tool(server_url: str, connection_name: str) -> Any:
+    """`query_oracle_db` and `update_oracle_incident` from the same MCP server, working on the blob database.
+
+    Foundry holds every `update_oracle_incident` call until someone approves it: the app shows its approval card
+    and answers with an mcp_approval_response, and the portal playground shows its own approve/deny prompt.
+    """
+    from azure.ai.projects.models import MCPTool, MCPToolFilter, MCPToolRequireApproval
+
+    return MCPTool(
+        server_label="oracle_db",
+        server_url=server_url,
+        allowed_tools=MCPToolFilter(tool_names=list(ORACLE_MCP_TOOLS)),
+        require_approval=MCPToolRequireApproval(
+            always=MCPToolFilter(tool_names=["update_oracle_incident"]),
+            never=MCPToolFilter(tool_names=["query_oracle_db"]),
+        ),
+        project_connection_id=connection_name,
+    )
+
+
 FOUNDRY_AGENT_INSTRUCTIONS = (
     "You are an Enterprise Operations AI Agent built on Microsoft Foundry. "
     "You answer questions using the Knowledge Base (File Search), query the Oracle DB "
@@ -217,7 +240,8 @@ FOUNDRY_AGENT_INSTRUCTIONS = (
     "outside sources. "
     "When a tool returns status PENDING_HITL, tell the user the change is waiting for a human "
     "operator's approval and don't call the tool again. Messages starting with [Operator update] "
-    "report the operator's approval decisions."
+    "report the operator's approval decisions. Approvals happen only in the operator's approval step, never "
+    "in the chat: if a change is rejected, say it wasn't made and don't ask the user to approve it by replying."
 )
 
 
@@ -235,6 +259,7 @@ class FoundryAgentOrchestrator:
         self.kb_tool = KnowledgeBaseTool(guardrails=self.guardrails)
         self.feedback_log = open_feedback_log()
         self.feedback_via_function = False  # True when Foundry calls the log_feedback MCP server itself
+        self.db_via_function = False  # True when Foundry calls the same server's DB tools (blob database)
         self.pending_actions: Dict[str, PendingApprovalAction] = {}
 
         # Optional Microsoft Foundry state (azure-ai-projects 2.x + OpenAI Responses API)
@@ -282,12 +307,17 @@ class FoundryAgentOrchestrator:
             )
 
             tools = [FileSearchTool(vector_store_ids=[self.kb_tool.vector_store_id])]
-            feedback_url = os.getenv("FEEDBACK_MCP_URL", "").strip()
-            feedback_connection = os.getenv("FEEDBACK_CONNECTION_NAME", "").strip()
-            self.feedback_via_function = bool(feedback_url and feedback_connection)
+            mcp_url = os.getenv("FEEDBACK_MCP_URL", "").strip()
+            mcp_connection = os.getenv("FEEDBACK_CONNECTION_NAME", "").strip()
+            self.feedback_via_function = bool(mcp_url and mcp_connection)
+            # The function's DB tools work on the blob database, so use them only when this app shows that one too
+            self.db_via_function = self.feedback_via_function and self.oracle_tool.db_mode == "azure_blob"
             for schema in FOUNDRY_TOOL_SCHEMAS:
                 if schema["name"] == "log_feedback" and self.feedback_via_function:
-                    tools.append(feedback_mcp_tool(feedback_url, feedback_connection))
+                    tools.append(feedback_mcp_tool(mcp_url, mcp_connection))
+                elif schema["name"] in ORACLE_MCP_TOOLS and self.db_via_function:
+                    if schema["name"] == ORACLE_MCP_TOOLS[0]:  # one MCP tool entry covers both
+                        tools.append(oracle_mcp_tool(mcp_url, mcp_connection))
                 else:
                     tools.append(FunctionTool(strict=True, **schema))
             definition = PromptAgentDefinition(
@@ -299,10 +329,14 @@ class FoundryAgentOrchestrator:
             self.foundry_agent_name = agent_name
             self.foundry_agent_version = agent_version
             self.foundry_conversation_id = self.openai_client.conversations.create().id
+            # Calls Foundry held in the previous conversation can no longer be answered
+            for action_id in [a for a, act in self.pending_actions.items() if act.foundry_approval_request_id]:
+                del self.pending_actions[action_id]
             feedback_where = "Azure Function (MCP)" if self.feedback_via_function else self.feedback_log.location
+            db_where = "Azure Function (MCP)" if self.db_via_function else "this app"
             self.foundry_status = (
                 f"Connected to {endpoint} — agent {agent_name} v{agent_version} ({agent_how}), {store_status}, "
-                f"feedback log: {feedback_where}."
+                f"feedback log: {feedback_where}, database tools: {db_where} ({self.oracle_tool.location})."
             )
         except Exception as exc:
             # Fall back to demo mode if credentials, roles, or the endpoint aren't ready yet
@@ -311,6 +345,7 @@ class FoundryAgentOrchestrator:
             self.foundry_agent_name = None
             self.foundry_agent_version = None
             self.feedback_via_function = False
+            self.db_via_function = False
             self.foundry_status = f"Foundry connection failed — using local demo mode. {type(exc).__name__}: {exc}"
 
     # ========================================================================
@@ -344,12 +379,32 @@ class FoundryAgentOrchestrator:
     # ========================================================================
     def _handle_foundry_sdk_turn(self, user_message: str) -> AgentTurnResponse:
         """Runs one turn on the Foundry agent, executing each function call through the guardrails."""
+        held = [act for act in self.pending_actions.values() if act.foundry_approval_request_id]
+        if held:
+            # Foundry rejects new input (HTTP 400) while an MCP approval request is unanswered
+            names = ", ".join(f"`{act.tool_name}` (`{act.action_id}`)" for act in held)
+            return AgentTurnResponse(
+                reply_markdown=(
+                    f"⏸️ Foundry is holding {names} until you approve or reject it below. The agent can't take "
+                    "another message until then, so decide on it first and then ask again."
+                ),
+                pending_approvals=held,
+            )
+        return self._run_foundry_turn([{"type": "message", "role": "user", "content": user_message}])
+
+    def _run_foundry_turn(self, items: List[Dict[str, Any]]) -> AgentTurnResponse:
+        """Sends `items` (after any queued operator notes) to the agent and answers its tool calls until it replies.
+
+        Function calls run here through the guardrails. MCP calls Foundry holds for approval are checked against
+        the same guardrails and then either answered at once (blocked, or approval switched off) or queued for
+        the operator, whose Approve/Reject goes back to Foundry through `_answer_mcp_approval`.
+        """
         traces: List[Dict[str, Any]] = []
         pending_list: List[PendingApprovalAction] = []
         agent_ref = {"agent_reference": {"name": self.foundry_agent_name, "type": "agent_reference"}}
 
         turn_input = [{"type": "message", "role": "user", "content": note} for note in self._operator_notes]
-        turn_input.append({"type": "message", "role": "user", "content": user_message})
+        turn_input.extend(items)
 
         try:
             response = self.openai_client.responses.create(
@@ -363,12 +418,10 @@ class FoundryAgentOrchestrator:
             # Every function call must get an output in the same conversation before the next turn,
             # so HITL-gated calls are answered with PENDING_HITL instead of leaving the call open.
             for round_no in range(MAX_TOOL_ROUNDS + 1):
-                calls = [item for item in response.output if item.type == "function_call"]
-                if not calls:
-                    break
-                outputs = []
-                for call in calls:
-                    if round_no == MAX_TOOL_ROUNDS:
+                over_limit = round_no == MAX_TOOL_ROUNDS
+                next_input: List[Dict[str, Any]] = []
+                for call in (item for item in response.output if item.type == "function_call"):
+                    if over_limit:
                         outcome: Dict[str, Any] = {
                             "error": "Tool call limit for this turn reached. Answer with what you have."
                         }
@@ -389,16 +442,22 @@ class FoundryAgentOrchestrator:
                                 foundry_conversation_id=self.foundry_conversation_id,
                                 foundry_call_id=call.call_id,
                             )
-                    outputs.append(
+                    next_input.append(
                         {
                             "type": "function_call_output",
                             "call_id": call.call_id,
                             "output": json.dumps(outcome, default=str),
                         }
                     )
+                for request in (item for item in response.output if item.type == "mcp_approval_request"):
+                    answer = self._review_mcp_approval(request, traces, pending_list, response.id, over_limit)
+                    if answer:
+                        next_input.append(answer)
+                if not next_input:
+                    break
                 response = self.openai_client.responses.create(
                     conversation=self.foundry_conversation_id,
-                    input=outputs,
+                    input=next_input,
                     extra_body=agent_ref,
                 )
                 self._trace_server_tool_calls(response, traces)
@@ -419,21 +478,81 @@ class FoundryAgentOrchestrator:
                 pending_approvals=pending_list,
             )
 
-        reply = response.output_text or "Completed run."
+        reply = response.output_text or ("" if pending_list else "Completed run.")
         if pending_list:
             reply = (
                 "⏸️ **Action Paused by Human-in-the-Loop (HITL) Guardrail**\n\n"
                 "The Foundry agent requested a state-modifying action that passed "
                 "automated safety checks and now requires your explicit approval below.\n\n" + reply
-            )
+            ).rstrip()
         return AgentTurnResponse(
             reply_markdown=reply,
             tool_traces=traces,
             pending_approvals=pending_list,
         )
 
+    def _review_mcp_approval(
+        self,
+        request: Any,
+        traces: List[Dict[str, Any]],
+        pending_list: List[PendingApprovalAction],
+        response_id: str,
+        over_limit: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Checks an MCP call Foundry holds for approval. Returns the answer to send now, or None once it's
+        queued for the operator."""
+        try:
+            args = json.loads(request.arguments or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        if request.name == "update_oracle_incident":
+            gr = self.guardrails.validate_db_incident_update(
+                str(args.get("incident_id") or ""),
+                str(args.get("new_status") or ""),
+                str(args.get("resolution_note") or ""),
+            )
+        else:
+            gr = self.guardrails.log_result(
+                GuardrailResult(
+                    passed=True,
+                    requires_hitl=True,
+                    status="PENDING_HITL",
+                    action_type=request.name,
+                    rule_triggered="MCP_APPROVAL_REQUIRED",
+                    message=f"Foundry holds this {request.name} call until it's approved.",
+                )
+            )
+        traces.append(
+            {
+                "tool": request.name,
+                "arguments": args,
+                "guardrail_status": gr.status,
+                "rule": gr.rule_triggered,
+                "message": gr.message,
+            }
+        )
+        if over_limit:
+            return {"type": "mcp_approval_response", "approval_request_id": request.id, "approve": False}
+        if not gr.passed or not gr.requires_hitl:
+            # Blocked by a guardrail: deny it. Approval switched off in the sidebar: approve it without asking.
+            return {"type": "mcp_approval_response", "approval_request_id": request.id, "approve": gr.passed}
+        act = PendingApprovalAction(
+            action_id=f"act-{uuid.uuid4().hex[:8]}",
+            tool_name=request.name,
+            arguments=args,
+            guardrail_result=gr,
+            foundry_response_id=response_id,
+            foundry_conversation_id=self.foundry_conversation_id,
+            foundry_approval_request_id=request.id,
+        )
+        self.pending_actions[act.action_id] = act
+        pending_list.append(act)
+        return None
+
     def _trace_server_tool_calls(self, response: Any, traces: List[Dict[str, Any]]) -> None:
-        """Records MCP tool calls Foundry ran itself (the log_feedback Azure Function), for the UI and kb_eval."""
+        """Records MCP tool calls Foundry ran itself on the Azure Function, for the UI and kb_eval."""
         for item in response.output:
             if item.type != "mcp_call":
                 continue
@@ -448,32 +567,43 @@ class FoundryAgentOrchestrator:
             if not isinstance(result, dict):
                 result = {}
             tool = getattr(item, "name", "") or "mcp"
-            ok = bool(result.get("success")) and not getattr(item, "error", None)
-            message = (
-                f"Foundry called the MCP server; logged {args.get('kind', 'entry')} as {result.get('entry_id')}."
-                if ok
-                else f"Foundry called the MCP server; no confirmed entry: {getattr(item, 'error', None) or result or 'no reply'}"
-            )
+            error = getattr(item, "error", None)
+            if error or not result:
+                status = "ERROR"
+            elif result.get("success"):
+                status = "PASSED"
+            else:  # the function's guardrails blocked it, or the database or table write failed
+                status = "BLOCKED" if result.get("guardrail_status") == "BLOCKED" else "ERROR"
+            if tool == "log_feedback":
+                message = (
+                    f"Foundry called the MCP server; logged {args.get('kind', 'entry')} as {result.get('entry_id')}."
+                    if status == "PASSED"
+                    else f"Foundry called the MCP server; no confirmed entry: {error or result or 'no reply'}"
+                )
+            else:
+                message = f"Foundry called the MCP server: {error or result.get('message') or result.get('error') or 'no reply'}"
             gr = self.guardrails.log_result(
                 GuardrailResult(
-                    passed=ok,
+                    passed=status == "PASSED",
                     requires_hitl=False,
-                    status="PASSED" if ok else "ERROR",
+                    status=status,
                     action_type=tool,
                     rule_triggered="AZURE_FUNCTION_MCP_TOOL",
                     message=message,
                 )
             )
-            traces.append(
-                {
-                    "tool": tool,
-                    "arguments": args,
-                    "guardrail_status": gr.status,
-                    "rule": gr.rule_triggered,
-                    "message": message,
-                    "entry_id": result.get("entry_id"),
-                }
-            )
+            trace = {
+                "tool": tool,
+                "arguments": args,
+                "guardrail_status": gr.status,
+                "rule": gr.rule_triggered,
+                "message": message,
+            }
+            if tool == "log_feedback":
+                trace["entry_id"] = result.get("entry_id")
+            if "rows" in result:
+                trace["rows"] = result["rows"]
+            traces.append(trace)
 
     # ========================================================================
     # Guarded Tool Dispatcher (Shared by Foundry SDK & Local Demo Mode)
@@ -492,28 +622,17 @@ class FoundryAgentOrchestrator:
         if fn_name == "query_oracle_db":
             sql_query = fn_args.get("sql_query", "")
             res = self.oracle_tool.execute_guarded_query(sql_query)
-            gr: GuardrailResult = res["guardrail"]
-            # A query can pass the guardrail and still fail in the database (e.g. a wrong column name);
-            # report that error, or the agent reads the empty row list as "no matching rows".
-            message = gr.message if res["success"] or not gr.passed else res.get("error", gr.message)
+            output = self.oracle_tool.query_tool_output(res)
             traces.append(
                 {
                     "tool": "query_oracle_db",
                     "arguments": fn_args,
-                    "guardrail_status": gr.status,
-                    "rule": gr.rule_triggered,
-                    "message": message,
-                    "rows": res.get("rows", []),
+                    "guardrail_status": output["guardrail_status"],
+                    "rule": res["guardrail"].rule_triggered,
+                    "message": output["message"],
+                    "rows": output["rows"],
                 }
             )
-            output = {
-                "success": res["success"],
-                "guardrail_status": gr.status,
-                "message": message,
-                "rows": res.get("rows", []),
-            }
-            if not res["success"]:
-                output["error"] = res.get("error", gr.message)
             return output
 
         if fn_name == "update_oracle_incident":
@@ -633,11 +752,13 @@ class FoundryAgentOrchestrator:
     # ========================================================================
     # Human-in-the-Loop Approval / Rejection Handlers
     # ========================================================================
-    def approve_pending_action(self, action_id: str) -> str:
+    def approve_pending_action(self, action_id: str) -> AgentTurnResponse:
         """Executes a previously queued action after the human operator clicks Approve."""
         act = self.pending_actions.pop(action_id, None)
         if not act:
-            return "Action ID not found or already processed."
+            return AgentTurnResponse("Action ID not found or already processed.")
+        if act.foundry_approval_request_id:
+            return self._answer_mcp_approval(act, approve=True)
 
         if act.tool_name == "propose_kb_file_update":
             res = self.kb_tool.commit_kb_update(
@@ -661,7 +782,7 @@ class FoundryAgentOrchestrator:
             self._note_operator_decision(
                 act, f"approved; '{res['filename']}' was updated and re-indexed ({res['foundry_sync']})"
             )
-            return (
+            return AgentTurnResponse(
                 f"✅ **Approved & Committed KB Update:** `{res['filename']}`\n\n"
                 f"- **Summary:** {res['change_summary']}\n"
                 f"- **Vector Store Status:** {res['foundry_sync']}"
@@ -673,26 +794,32 @@ class FoundryAgentOrchestrator:
                 new_status=act.arguments["new_status"],
                 resolution_note=act.arguments["resolution_note"],
             )
+            outcome = res.get("message") or res.get("error", "")
             self.guardrails.log_result(
                 GuardrailResult(
-                    passed=True,
+                    passed=res["success"],
                     requires_hitl=False,
-                    status="APPROVED",
+                    status="APPROVED" if res["success"] else "ERROR",
                     action_type="update_oracle_incident",
                     rule_triggered="HUMAN_OPERATOR_APPROVED",
-                    message=res.get("message", "Approved Oracle DB incident update."),
+                    message=outcome or "Approved Oracle DB incident update.",
                 )
             )
-            self._note_operator_decision(act, f"approved and executed: {res.get('message', '')}")
-            return f"✅ **Approved & Executed Oracle DB Update:** {res.get('message', '')}"
+            if not res["success"]:
+                self._note_operator_decision(act, f"approved, but the update failed: {outcome}")
+                return AgentTurnResponse(f"⚠️ **Approved, but the Oracle DB update failed:** {outcome}")
+            self._note_operator_decision(act, f"approved and executed: {outcome}")
+            return AgentTurnResponse(f"✅ **Approved & Executed Oracle DB Update:** {outcome}")
 
-        return "Action executed."
+        return AgentTurnResponse("Action executed.")
 
-    def reject_pending_action(self, action_id: str) -> str:
+    def reject_pending_action(self, action_id: str) -> AgentTurnResponse:
         """Cancels a queued HITL action when the human operator clicks Reject."""
         act = self.pending_actions.pop(action_id, None)
         if not act:
-            return "Action ID not found or already processed."
+            return AgentTurnResponse("Action ID not found or already processed.")
+        if act.foundry_approval_request_id:
+            return self._answer_mcp_approval(act, approve=False)
 
         self.guardrails.log_result(
             GuardrailResult(
@@ -705,7 +832,39 @@ class FoundryAgentOrchestrator:
             )
         )
         self._note_operator_decision(act, "rejected; no changes were made")
-        return f"🛑 **Rejected Action:** `{act.tool_name}` was cancelled by operator. No changes were made."
+        return AgentTurnResponse(
+            f"🛑 **Rejected Action:** `{act.tool_name}` was cancelled by operator. No changes were made."
+        )
+
+    def _answer_mcp_approval(self, act: PendingApprovalAction, approve: bool) -> AgentTurnResponse:
+        """Sends the operator's decision on an MCP call Foundry is holding. On approval Foundry calls the Azure
+        Function; either way the agent then carries on, and its reply follows the decision."""
+        self.guardrails.log_result(
+            GuardrailResult(
+                passed=approve,
+                requires_hitl=False,
+                status="APPROVED" if approve else "REJECTED",
+                action_type=act.tool_name,
+                rule_triggered="HUMAN_OPERATOR_APPROVED" if approve else "HUMAN_OPERATOR_REJECTED",
+                message=f"Operator {'approved' if approve else 'rejected'} the {act.tool_name} call held by Foundry.",
+            )
+        )
+        turn = self._run_foundry_turn(
+            [
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": act.foundry_approval_request_id,
+                    "approve": approve,
+                }
+            ]
+        )
+        head = (
+            f"✅ **Approved:** Foundry sent `{act.tool_name}` to the Azure Function."
+            if approve
+            else f"🛑 **Rejected Action:** `{act.tool_name}` was cancelled by operator. No changes were made."
+        )
+        turn.reply_markdown = f"{head}\n\n{turn.reply_markdown}".rstrip()
+        return turn
 
     def _note_operator_decision(self, act: PendingApprovalAction, outcome: str) -> None:
         """Queues an approval decision so the Foundry agent learns about it on the next turn."""

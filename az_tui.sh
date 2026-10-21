@@ -1239,7 +1239,7 @@ menu_feedback() {
     echo "  3) List problem reports"
     echo "  4) Show one entry in full"
     echo "  5) Delete an entry"
-    echo "  6) Deploy or update the log function (deploy_feedback_function.sh)"
+    echo "  6) Deploy or update the Azure Function (feedback log + DB tools)"
     echo "  0) ← Back"
     [[ -n $FB_ACCOUNT ]] || echo -e "  ${DIM}No feedback table in .env yet, so this shows the app's local file; option 6 sets up the table.${RESET}"
     echo
