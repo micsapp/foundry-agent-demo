@@ -118,7 +118,9 @@ def main() -> int:
     if mode != "foundry":
         print("Note: demo mode is a local keyword lookup, not an LLM; set AGENT_MODE=foundry for a real test.")
 
-    orch = FoundryAgentOrchestrator(agent_mode=mode, db_mode=os.getenv("DB_MODE", "sqlite_mock"))
+    orch = FoundryAgentOrchestrator(
+        agent_mode=mode, db_mode=os.getenv("DB_MODE", "sqlite_mock"), kb_mode=os.getenv("KB_MODE", "local")
+    )
     if mode == "foundry":
         print(f"Foundry: {orch.foundry_status}")
         if orch.openai_client is None:

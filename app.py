@@ -33,6 +33,7 @@ if "orchestrator" not in st.session_state:
     st.session_state.orchestrator = FoundryAgentOrchestrator(
         agent_mode=os.getenv("AGENT_MODE", "demo"),
         db_mode=os.getenv("DB_MODE", "sqlite_mock"),
+        kb_mode=os.getenv("KB_MODE", "local"),
     )
 
 if "messages" not in st.session_state:
@@ -134,9 +135,13 @@ with st.sidebar:
     col_reset1, col_reset2 = st.columns(2)
     with col_reset1:
         if st.button("🔄 Reset KB Files", width="stretch"):
-            orch.kb_tool.reset_kb_files()
-            st.toast("Knowledge Base files restored to initial state!", icon="📄")
-            st.rerun()
+            try:
+                orch.kb_tool.reset_kb_files()
+            except Exception as exc:
+                st.error(f"Couldn't reset {orch.kb_tool.location}: `{type(exc).__name__}: {str(exc)[:200]}`")
+            else:
+                st.toast("Knowledge Base files restored to initial state!", icon="📄")
+                st.rerun()
     with col_reset2:
         if st.button("🔄 Reset Oracle DB", width="stretch"):
             try:
@@ -224,8 +229,22 @@ with tab_db:
 # Tab 3: Live Knowledge Base Source Files
 # ----------------------------------------------------------------------------
 with tab_kb:
-    st.subheader("📚 Knowledge Base Source Files (`knowledge_base/*.md`, `*.pdf`)")
-    kb_files = orch.kb_tool.list_kb_files()
+    st.subheader("📚 Knowledge Base Source Files (`*.md`, `*.pdf`)")
+    st.caption(
+        f"Source files in {orch.kb_tool.location}. File Search searches the vector store's indexed copy of each "
+        "file; an approved update saves the file and re-indexes it."
+        + (
+            " Foundry runs KB updates on the Azure Function (an MCP server), which edits these same files, so "
+            "updates approved in the portal playground show up here too."
+            if orch.kb_via_function
+            else ""
+        )
+    )
+    try:
+        kb_files = orch.kb_tool.list_kb_files()
+    except Exception as exc:
+        kb_files = []
+        st.error(f"Couldn't list {orch.kb_tool.location}: `{type(exc).__name__}: {str(exc)[:200]}`")
     selected_kb = st.selectbox("Select Knowledge Base File to Inspect:", kb_files)
     if selected_kb:
         content = orch.kb_tool.read_kb_file(selected_kb)
@@ -299,6 +318,7 @@ with tab_arch:
            - **SQL Guardrail** intercepts every query before `python-oracledb` executes it: blocking `DROP`/`DELETE`/`UPDATE`, preventing multi-statement `;` injection, and enforcing table/column allowlists.
         3. **Knowledge Base Update Action Tool (`propose_kb_file_update`):**
            - Because Vector Store files are read-only to the model, updating a KB file is exposed as an **Action Tool**.
+           - With `KB_MODE=azure_blob` and the Azure Function deployed, it's an **MCP tool** that Foundry calls on the function after the update is approved; the KB files live in an Azure blob container that the function and this app share. Otherwise it's a `FunctionTool` that this app runs on `knowledge_base/`.
            - **KB Guardrail** checks for path traversal, scans for accidental PII/secrets (`SSN`, `sk-...` API keys), generates a `difflib` unified diff, and answers the agent's `function_call` with `PENDING_HITL` until a human clicks **Approve**.
            - Upon approval, the tool writes the updated Markdown file, uploads it to the agent's vector store via `vector_stores.files.upload_and_poll`, removes the outdated `file_id`, and tells the agent the outcome on the next turn.
         4. **Feedback Log Tool (`log_feedback`):**
@@ -380,6 +400,11 @@ with tab_chat:
                     if act.guardrail_result.diff_preview:
                         st.markdown("**Unified Diff Preview (Before vs. After):**")
                         st.code(act.guardrail_result.diff_preview, language="diff")
+                    if act.foundry_approval_request_id:
+                        st.caption(
+                            "Foundry is holding this call. When you approve, it sends it to the Azure Function, "
+                            "which saves the file and re-indexes it in the vector store."
+                        )
                 elif act.tool_name == "update_oracle_incident":
                     st.markdown(
                         f"- **Oracle Table:** `SYSTEM_INCIDENTS`\n"

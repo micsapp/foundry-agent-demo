@@ -3,16 +3,21 @@ Azure Function serving the agent's server-side tools over MCP (Model Context Pro
 
 - `log_feedback` writes to the Azure Table named by FEEDBACK_TABLE_NAME.
 - `query_oracle_db` and `update_oracle_incident` work on the Oracle-compatible mock database kept as a SQLite
-  blob (ORACLE_MOCK_BLOB_URL), with the same guardrails as the Streamlit app. The agent definition makes Foundry
-  ask a person to approve each `update_oracle_incident` call before it reaches this function.
+  blob (ORACLE_MOCK_BLOB_URL), with the same guardrails as the Streamlit app.
+- `propose_kb_file_update` edits a Knowledge Base Markdown file in the blob container KB_BLOB_CONTAINER_URL and
+  re-indexes it in the vector store File Search uses (the one named in the container's sync record), with the
+  same guardrails as the app. It reaches the vector store as the Function App's identity (Foundry User role).
+
+The agent definition makes Foundry ask a person to approve each `update_oracle_incident` and
+`propose_kb_file_update` call before it reaches this function, so neither asks again here.
 
 Foundry connects to https://<app>/runtime/webhooks/mcp (streamable HTTP) with the app's `mcp_extension`
 system key, which it keeps in a Foundry project connection, not in code. Storage is reached with the
 Function App's managed identity. Because Foundry calls the server itself, the tools also work in the portal
 playground, and MCP is a tool type gpt-5-mini supports.
 
-Deployed by ../deploy_feedback_function.sh, which copies feedback_log.py, oracle_tool.py and guardrails.py next
-to this file so masking, guardrails and the database code match the Streamlit app exactly, and writes
+Deployed by ../deploy_feedback_function.sh, which copies feedback_log.py, oracle_tool.py, kb_tool.py and
+guardrails.py next to this file so masking, guardrails and the storage code match the Streamlit app exactly, and writes
 build_id.txt so the script can tell when the new code is live (GET /api/health returns it).
 """
 
@@ -25,11 +30,13 @@ import azure.functions as func
 
 from feedback_log import FEEDBACK_KINDS, TableFeedbackLog
 from guardrails import GuardrailEngine
+from kb_tool import KnowledgeBaseTool
 from oracle_tool import OracleDatabaseTool
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 _store = None
 _db = None
+_kb = None
 _build_file = Path(__file__).with_name("build_id.txt")
 BUILD_ID = _build_file.read_text().strip() if _build_file.exists() else "dev"
 
@@ -40,6 +47,20 @@ def _database() -> OracleDatabaseTool:
         # Foundry asks a person before each update reaches this function, so no second approval step here
         _db = OracleDatabaseTool(GuardrailEngine(require_hitl_for_db_write=False), db_mode="azure_blob")
     return _db
+
+
+def _knowledge_base() -> KnowledgeBaseTool:
+    global _kb
+    if _kb is None:
+        from azure.ai.projects import AIProjectClient
+        from azure.identity import DefaultAzureCredential
+
+        endpoint = os.environ["PROJECT_ENDPOINT"]
+        kb = KnowledgeBaseTool(GuardrailEngine(require_hitl_for_kb_update=False), kb_mode="azure_blob")
+        project = AIProjectClient(endpoint=endpoint, credential=DefaultAzureCredential())
+        kb.attach_vector_store(project.get_openai_client(), endpoint)
+        _kb = kb
+    return _kb
 
 
 @app.mcp_tool()
@@ -103,6 +124,28 @@ def update_oracle_incident(incident_id: str, new_status: str, resolution_note: s
     result = db.commit_incident_update(incident_id, new_status, resolution_note)
     logging.info("update_oracle_incident %s: %s", incident_id, result.get("message") or result.get("error"))
     return json.dumps(result)
+
+
+@app.mcp_tool()
+@app.mcp_tool_property(
+    arg_name="filename", description="Target Markdown filename in knowledge_base/ (e.g. oracle_db_runbook.md)."
+)
+@app.mcp_tool_property(arg_name="updated_content", description="Complete updated Markdown content for the file.")
+@app.mcp_tool_property(arg_name="change_summary", description="Concise summary of what was added or changed.")
+def propose_kb_file_update(filename: str, updated_content: str, change_summary: str) -> str:
+    """
+    Proposes an update to a Markdown source file in the Knowledge Base (e.g., oracle_db_runbook.md or
+    sla_and_escalation_guide.md) and syncs it to the Foundry vector store after passing PII guardrails and
+    Human-in-the-Loop approval."""
+    kb = _knowledge_base()
+    gr = kb.propose_kb_update(filename, updated_content, change_summary)
+    if not gr.passed:
+        return json.dumps({"success": False, "guardrail_status": gr.status, "message": gr.message})
+    res = kb.commit_kb_update(filename, updated_content, change_summary)
+    logging.info("propose_kb_file_update %s: %s", res["filename"], res["foundry_sync"])
+    return json.dumps(
+        {"success": True, "filename": res["filename"], "message": f"Saved {res['filename']}. {res['foundry_sync']}"}
+    )
 
 
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)

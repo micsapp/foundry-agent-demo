@@ -3,7 +3,7 @@
 An end-to-end demo project showcasing how a **Microsoft (Azure) AI Foundry Agent** can:
 1. **Answer Questions from a Knowledge Base** using Foundry's **Vector Store (`FileSearchTool`)**.
 2. **Query & Update an Oracle Database** using custom **Function Tools** (`python-oracledb` with a built-in SQLite mock fallback for instant local testing), or as **MCP tools** on an Azure Function so they also work in the Foundry portal playground.
-3. **Update Knowledge Base Source Files** (`knowledge_base/*.md`) and re-sync the Vector Store.
+3. **Update Knowledge Base Source Files** (`knowledge_base/*.md`, or the same files in Azure Storage) and re-sync the Vector Store.
 4. **Enforce Multi-Layer Guardrails & Human-in-the-Loop (HITL) Approval** on every agent action.
 
 ---
@@ -56,12 +56,15 @@ The portal playground can't run the app's function tools: it stops at "Enter fun
 ```bash
 ./deploy_feedback_function.sh   # needs az login and PROJECT_ENDPOINT in .env; safe to re-run
 ```
-It creates a storage account (the `feedback` table and the `oracle-mock` blob container) and a Flex Consumption Function App (`azure_function/`) in the Foundry resource's resource group. The function is an **MCP server** (Azure Functions MCP tool trigger) with three tools:
+It creates a storage account (the `feedback` table and the `oracle-mock` and `knowledge-base` blob containers) and a Flex Consumption Function App (`azure_function/`) in the Foundry resource's resource group. The function is an **MCP server** (Azure Functions MCP tool trigger) with four tools:
 - `log_feedback` writes to the table, with no approval step.
-- `query_oracle_db` and `update_oracle_incident` work on the mock Oracle database: the same SQLite tables, kept as a blob (`demo_oracle_mock.db`) that the function creates on first use, with the same guardrails as the app. Foundry holds every `update_oracle_incident` call until someone approves it: the app shows its approval card, and the playground shows an approve/deny prompt.
+- `query_oracle_db` and `update_oracle_incident` work on the mock Oracle database: the same SQLite tables, kept as a blob (`demo_oracle_mock.db`) that the function creates on first use, with the same guardrails as the app.
+- `propose_kb_file_update` edits the Knowledge Base files, which now live in the `knowledge-base` container (seeded from `knowledge_base/`; files already there are kept). File Search never reads these files directly; it searches the vector store's indexed copy. So after the guardrail checks the function saves the new file (the old one goes to `backups/` in the container), uploads it to the vector store, waits until it's indexed and only then removes the old copy. From then on File Search returns the new text. The function reaches the vector store as its own identity, which gets the Foundry User role on the Foundry resource.
 
-The script stores the server's `mcp_extension` key in a Foundry project connection (Custom keys, sent as the `x-functions-key` header), and writes `FEEDBACK_*`, `DB_MODE=azure_blob` and `ORACLE_MOCK_BLOB_URL` to `.env`. On the next start the agent gets these tools as MCP tools; `propose_kb_file_update` stays a function tool that the app runs, because it edits files on this machine. With `DB_MODE=azure_blob` the app's DB tab, Reset button and demo mode use the same blob, so changes approved in the playground show up in the app (the script grants you Storage Table Data Contributor and Storage Blob Data Contributor on the container). MCP is used rather than an OpenAPI tool because Microsoft's tool-support table lists MCP, but not OpenAPI or function tools, for gpt-5-mini.
+Foundry holds every `update_oracle_incident` and `propose_kb_file_update` call until someone approves it: the app shows its approval card (with the diff for KB updates), and the playground shows an approve/deny prompt.
 
-The sidebar's guardrail switches only change the app: the function always enforces read-only SQL and the table and column allowlist. Switching off approval for DB writes makes the app approve Foundry's requests itself; the playground still asks.
+The script stores the server's `mcp_extension` key in a Foundry project connection (Custom keys, sent as the `x-functions-key` header), and writes `FEEDBACK_*`, `DB_MODE=azure_blob`, `ORACLE_MOCK_BLOB_URL`, `KB_MODE=azure_blob` and `KB_BLOB_CONTAINER_URL` to `.env`. On the next start the agent gets all four as MCP tools. The app's DB and KB tabs, Reset buttons and demo mode then use the same blobs, so changes approved in the playground show up in the app (the script grants you Storage Table Data Contributor and Storage Blob Data Contributor on the containers). The record of which vector store file holds each KB file moves with them (`vector_store_sync.json` in the container), so the app and the function keep the vector store in step. MCP is used rather than an OpenAPI tool because Microsoft's tool-support table lists MCP, but not OpenAPI or function tools, for gpt-5-mini.
+
+The sidebar's guardrail switches only change the app: the function always enforces read-only SQL and the table and column allowlist. Switching off approval for DB writes or KB updates makes the app approve Foundry's requests itself; the playground still asks.
 
 `./az_tui.sh` → 11 (Cost & Credits) shows this month's cost by service, resource group or resource, daily cost, the free-credit balance and expiry, and invoices, and manages monthly budget alerts.

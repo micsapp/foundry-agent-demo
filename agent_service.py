@@ -27,6 +27,7 @@ FOUNDRY_AGENT_NAME = "Oracle-And-KB-Guarded-Agent"
 KB_VECTOR_STORE_NAME = "Enterprise-Oracle-KB-Store"
 MAX_TOOL_ROUNDS = 8  # function-call round trips allowed in one user turn
 ORACLE_MCP_TOOLS = ("query_oracle_db", "update_oracle_incident")  # served by the Azure Function in azure_blob mode
+KB_MCP_TOOL = "propose_kb_file_update"  # served by the Azure Function when KB_MODE=azure_blob
 DEMO_KB_MIN_SCORE = 2.0  # demo-mode KB hits below this matched only common words
 PROBLEM_REPORT_PATTERN = re.compile(
     r"\b(report(ing)? (a|an) (problem|issue|bug)|broken|not working|(doesn't|does not|isn't|is not) working"
@@ -220,6 +221,23 @@ def oracle_mcp_tool(server_url: str, connection_name: str) -> Any:
     )
 
 
+def knowledge_base_mcp_tool(server_url: str, connection_name: str) -> Any:
+    """`propose_kb_file_update` from the same MCP server, editing the KB files in the blob container.
+
+    Foundry holds every call until someone approves it (the app's card shows the diff); the function then saves
+    the file and re-indexes it in the vector store that File Search uses.
+    """
+    from azure.ai.projects.models import MCPTool, MCPToolFilter
+
+    return MCPTool(
+        server_label="knowledge_base",
+        server_url=server_url,
+        allowed_tools=MCPToolFilter(tool_names=[KB_MCP_TOOL]),
+        require_approval="always",
+        project_connection_id=connection_name,
+    )
+
+
 FOUNDRY_AGENT_INSTRUCTIONS = (
     "You are an Enterprise Operations AI Agent built on Microsoft Foundry. "
     "You answer questions using the Knowledge Base (File Search), query the Oracle DB "
@@ -245,6 +263,13 @@ FOUNDRY_AGENT_INSTRUCTIONS = (
 )
 
 
+def _trace_arguments(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Tool arguments for the UI trace; a KB update's full file content is left out (the diff shows the change)."""
+    if tool == KB_MCP_TOOL:
+        return {k: args.get(k) for k in ("filename", "change_summary")}
+    return args
+
+
 class FoundryAgentOrchestrator:
     """Orchestrates conversations, Knowledge Base retrieval, Oracle DB queries, and Guardrail checks."""
 
@@ -252,14 +277,16 @@ class FoundryAgentOrchestrator:
         self,
         agent_mode: str = "demo",
         db_mode: str = "sqlite_mock",
+        kb_mode: str = "local",
     ) -> None:
         self.agent_mode = agent_mode
         self.guardrails = GuardrailEngine()
         self.oracle_tool = OracleDatabaseTool(guardrails=self.guardrails, db_mode=db_mode)
-        self.kb_tool = KnowledgeBaseTool(guardrails=self.guardrails)
+        self.kb_tool = KnowledgeBaseTool(guardrails=self.guardrails, kb_mode=kb_mode)
         self.feedback_log = open_feedback_log()
         self.feedback_via_function = False  # True when Foundry calls the log_feedback MCP server itself
         self.db_via_function = False  # True when Foundry calls the same server's DB tools (blob database)
+        self.kb_via_function = False  # True when Foundry calls the same server's KB update tool (blob KB files)
         self.pending_actions: Dict[str, PendingApprovalAction] = {}
 
         # Optional Microsoft Foundry state (azure-ai-projects 2.x + OpenAI Responses API)
@@ -312,12 +339,15 @@ class FoundryAgentOrchestrator:
             self.feedback_via_function = bool(mcp_url and mcp_connection)
             # The function's DB tools work on the blob database, so use them only when this app shows that one too
             self.db_via_function = self.feedback_via_function and self.oracle_tool.db_mode == "azure_blob"
+            self.kb_via_function = self.feedback_via_function and self.kb_tool.kb_mode == "azure_blob"
             for schema in FOUNDRY_TOOL_SCHEMAS:
                 if schema["name"] == "log_feedback" and self.feedback_via_function:
                     tools.append(feedback_mcp_tool(mcp_url, mcp_connection))
                 elif schema["name"] in ORACLE_MCP_TOOLS and self.db_via_function:
                     if schema["name"] == ORACLE_MCP_TOOLS[0]:  # one MCP tool entry covers both
                         tools.append(oracle_mcp_tool(mcp_url, mcp_connection))
+                elif schema["name"] == KB_MCP_TOOL and self.kb_via_function:
+                    tools.append(knowledge_base_mcp_tool(mcp_url, mcp_connection))
                 else:
                     tools.append(FunctionTool(strict=True, **schema))
             definition = PromptAgentDefinition(
@@ -334,9 +364,11 @@ class FoundryAgentOrchestrator:
                 del self.pending_actions[action_id]
             feedback_where = "Azure Function (MCP)" if self.feedback_via_function else self.feedback_log.location
             db_where = "Azure Function (MCP)" if self.db_via_function else "this app"
+            kb_where = "Azure Function (MCP)" if self.kb_via_function else "this app"
             self.foundry_status = (
                 f"Connected to {endpoint} — agent {agent_name} v{agent_version} ({agent_how}), {store_status}, "
-                f"feedback log: {feedback_where}, database tools: {db_where} ({self.oracle_tool.location})."
+                f"feedback log: {feedback_where}, database tools: {db_where} ({self.oracle_tool.location}), "
+                f"KB updates: {kb_where} ({self.kb_tool.location})."
             )
         except Exception as exc:
             # Fall back to demo mode if credentials, roles, or the endpoint aren't ready yet
@@ -346,6 +378,7 @@ class FoundryAgentOrchestrator:
             self.foundry_agent_version = None
             self.feedback_via_function = False
             self.db_via_function = False
+            self.kb_via_function = False
             self.foundry_status = f"Foundry connection failed — using local demo mode. {type(exc).__name__}: {exc}"
 
     # ========================================================================
@@ -513,6 +546,13 @@ class FoundryAgentOrchestrator:
                 str(args.get("new_status") or ""),
                 str(args.get("resolution_note") or ""),
             )
+        elif request.name == KB_MCP_TOOL:
+            # Same checks the function runs, against the current file, so the approval card can show the diff
+            gr = self.kb_tool.propose_kb_update(
+                str(args.get("filename") or ""),
+                str(args.get("updated_content") or ""),
+                str(args.get("change_summary") or ""),
+            )
         else:
             gr = self.guardrails.log_result(
                 GuardrailResult(
@@ -527,10 +567,11 @@ class FoundryAgentOrchestrator:
         traces.append(
             {
                 "tool": request.name,
-                "arguments": args,
+                "arguments": _trace_arguments(request.name, args),
                 "guardrail_status": gr.status,
                 "rule": gr.rule_triggered,
                 "message": gr.message,
+                "diff_preview": gr.diff_preview,
             }
         )
         if over_limit:
@@ -594,7 +635,7 @@ class FoundryAgentOrchestrator:
             )
             trace = {
                 "tool": tool,
-                "arguments": args,
+                "arguments": _trace_arguments(tool, args),
                 "guardrail_status": gr.status,
                 "rule": gr.rule_triggered,
                 "message": message,
