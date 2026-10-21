@@ -24,7 +24,7 @@ import math
 import os
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -135,7 +135,7 @@ class KnowledgeBaseTool:
     def blob(self) -> BlobKnowledgeBase:
         if self._blob is None:
             if not self.blob_container_url:
-                raise RuntimeError("KB_BLOB_CONTAINER_URL is not set; ./deploy_feedback_function.sh writes it to .env.")
+                raise RuntimeError("KB_BLOB_CONTAINER_URL is not set; ./deploy_mcp_tools.sh writes it to .env.")
             self._blob = BlobKnowledgeBase(self.blob_container_url)
         return self._blob
 
@@ -171,7 +171,7 @@ class KnowledgeBaseTool:
     def _write_file(self, filename: str, content: str) -> None:
         """Saves a KB file, first keeping the current version as a timestamped backup."""
         current = self._read_bytes(filename)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")  # UTC, so the app's and the function's agree
         if self.kb_mode == "azure_blob":
             if current is not None:
                 self.blob.write(f"backups/{filename}.{ts}.bak", current)
@@ -242,7 +242,7 @@ class KnowledgeBaseTool:
         if not state.get("vector_store_id") or state.get("project_endpoint") != project_endpoint:
             raise RuntimeError(
                 f"The sync record in {self.location} names no vector store for {project_endpoint}. Start the app "
-                "once in foundry mode with KB_MODE=azure_blob (or re-run ./deploy_feedback_function.sh)."
+                "once in foundry mode with KB_MODE=azure_blob (or re-run ./deploy_mcp_tools.sh)."
             )
         self.openai_client = openai_client
         self.vector_store_id = state["vector_store_id"]

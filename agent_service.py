@@ -28,6 +28,13 @@ KB_VECTOR_STORE_NAME = "Enterprise-Oracle-KB-Store"
 MAX_TOOL_ROUNDS = 8  # function-call round trips allowed in one user turn
 ORACLE_MCP_TOOLS = ("query_oracle_db", "update_oracle_incident")  # served by the Azure Function in azure_blob mode
 KB_MCP_TOOL = "propose_kb_file_update"  # served by the Azure Function when KB_MODE=azure_blob
+# Foundry project connections holding the MCP server's key, one per tool group so the portal tells the tools
+# apart (it lists each MCP tool by connection name and URL). deploy_mcp_tools.sh creates them.
+MCP_CONNECTIONS = {
+    "feedback_log": "feedback-log-mcp",
+    "oracle_db": "oracle-db-mcp",
+    "knowledge_base": "knowledge-base-mcp",
+}
 DEMO_KB_MIN_SCORE = 2.0  # demo-mode KB hits below this matched only common words
 PROBLEM_REPORT_PATTERN = re.compile(
     r"\b(report(ing)? (a|an) (problem|issue|bug)|broken|not working|(doesn't|does not|isn't|is not) working"
@@ -184,8 +191,8 @@ FOUNDRY_TOOL_SCHEMAS = [
 
 
 
-def feedback_mcp_tool(server_url: str, connection_name: str) -> Any:
-    """`log_feedback` from the Azure Function's MCP server (deploy_feedback_function.sh sets it up).
+def feedback_mcp_tool(server_url: str) -> Any:
+    """`log_feedback` from the Azure Function's MCP server (deploy_mcp_tools.sh sets it up).
 
     Foundry calls the server itself and sends the key stored in the project connection as the
     x-functions-key header, so the key never appears in this code or in the agent definition.
@@ -197,11 +204,11 @@ def feedback_mcp_tool(server_url: str, connection_name: str) -> Any:
         server_url=server_url,
         allowed_tools=MCPToolFilter(tool_names=["log_feedback"]),  # the form Foundry stores, so reuse checks match
         require_approval="never",  # append-only log; an approval step would stall the portal playground
-        project_connection_id=connection_name,
+        project_connection_id=MCP_CONNECTIONS["feedback_log"],
     )
 
 
-def oracle_mcp_tool(server_url: str, connection_name: str) -> Any:
+def oracle_mcp_tool(server_url: str) -> Any:
     """`query_oracle_db` and `update_oracle_incident` from the same MCP server, working on the blob database.
 
     Foundry holds every `update_oracle_incident` call until someone approves it: the app shows its approval card
@@ -217,11 +224,11 @@ def oracle_mcp_tool(server_url: str, connection_name: str) -> Any:
             always=MCPToolFilter(tool_names=["update_oracle_incident"]),
             never=MCPToolFilter(tool_names=["query_oracle_db"]),
         ),
-        project_connection_id=connection_name,
+        project_connection_id=MCP_CONNECTIONS["oracle_db"],
     )
 
 
-def knowledge_base_mcp_tool(server_url: str, connection_name: str) -> Any:
+def knowledge_base_mcp_tool(server_url: str) -> Any:
     """`propose_kb_file_update` from the same MCP server, editing the KB files in the blob container.
 
     Foundry holds every call until someone approves it (the app's card shows the diff); the function then saves
@@ -234,7 +241,7 @@ def knowledge_base_mcp_tool(server_url: str, connection_name: str) -> Any:
         server_url=server_url,
         allowed_tools=MCPToolFilter(tool_names=[KB_MCP_TOOL]),
         require_approval="always",
-        project_connection_id=connection_name,
+        project_connection_id=MCP_CONNECTIONS["knowledge_base"],
     )
 
 
@@ -277,12 +284,14 @@ class FoundryAgentOrchestrator:
         self,
         agent_mode: str = "demo",
         db_mode: str = "sqlite_mock",
-        kb_mode: str = "local",
+        kb_mode: Optional[str] = None,
     ) -> None:
         self.agent_mode = agent_mode
         self.guardrails = GuardrailEngine()
         self.oracle_tool = OracleDatabaseTool(guardrails=self.guardrails, db_mode=db_mode)
-        self.kb_tool = KnowledgeBaseTool(guardrails=self.guardrails, kb_mode=kb_mode)
+        # Defaults to KB_MODE: a run in the other mode would make the shared vector store match its own copy of
+        # the files (and create a different agent version)
+        self.kb_tool = KnowledgeBaseTool(guardrails=self.guardrails, kb_mode=kb_mode or os.getenv("KB_MODE", "local"))
         self.feedback_log = open_feedback_log()
         self.feedback_via_function = False  # True when Foundry calls the log_feedback MCP server itself
         self.db_via_function = False  # True when Foundry calls the same server's DB tools (blob database)
@@ -334,20 +343,19 @@ class FoundryAgentOrchestrator:
             )
 
             tools = [FileSearchTool(vector_store_ids=[self.kb_tool.vector_store_id])]
-            mcp_url = os.getenv("FEEDBACK_MCP_URL", "").strip()
-            mcp_connection = os.getenv("FEEDBACK_CONNECTION_NAME", "").strip()
-            self.feedback_via_function = bool(mcp_url and mcp_connection)
+            mcp_url = os.getenv("MCP_SERVER_URL", "").strip()
+            self.feedback_via_function = bool(mcp_url)
             # The function's DB tools work on the blob database, so use them only when this app shows that one too
             self.db_via_function = self.feedback_via_function and self.oracle_tool.db_mode == "azure_blob"
             self.kb_via_function = self.feedback_via_function and self.kb_tool.kb_mode == "azure_blob"
             for schema in FOUNDRY_TOOL_SCHEMAS:
                 if schema["name"] == "log_feedback" and self.feedback_via_function:
-                    tools.append(feedback_mcp_tool(mcp_url, mcp_connection))
+                    tools.append(feedback_mcp_tool(mcp_url))
                 elif schema["name"] in ORACLE_MCP_TOOLS and self.db_via_function:
                     if schema["name"] == ORACLE_MCP_TOOLS[0]:  # one MCP tool entry covers both
-                        tools.append(oracle_mcp_tool(mcp_url, mcp_connection))
+                        tools.append(oracle_mcp_tool(mcp_url))
                 elif schema["name"] == KB_MCP_TOOL and self.kb_via_function:
-                    tools.append(knowledge_base_mcp_tool(mcp_url, mcp_connection))
+                    tools.append(knowledge_base_mcp_tool(mcp_url))
                 else:
                     tools.append(FunctionTool(strict=True, **schema))
             definition = PromptAgentDefinition(

@@ -13,12 +13,15 @@
 #      can re-index updated KB files in the vector store
 #   4. Code from azure_function/ plus feedback_log.py, oracle_tool.py, kb_tool.py and guardrails.py, built remotely
 #   5. Waits until the new build answers on /api/health
-#   6. The app's mcp_extension system key, stored in a Foundry MCP ("remote tool") connection and nowhere else
-#   7. MCP smoke test (lists the tools, runs one read-only query), then FEEDBACK_MCP_URL,
-#      FEEDBACK_CONNECTION_NAME, FEEDBACK_TABLE_ENDPOINT, FEEDBACK_TABLE_NAME, DB_MODE=azure_blob,
-#      ORACLE_MOCK_BLOB_URL, KB_MODE=azure_blob and KB_BLOB_CONTAINER_URL in .env
+#   6. The app's mcp_extension system key, stored only in the Foundry MCP ("remote tool") connections
+#      feedback-log-mcp, oracle-db-mcp and knowledge-base-mcp (one per tool group, so the portal tells them apart)
+#   7. MCP smoke test (lists the tools, runs one read-only query), then MCP_SERVER_URL, FEEDBACK_TABLE_ENDPOINT,
+#      FEEDBACK_TABLE_NAME, DB_MODE=azure_blob, ORACLE_MOCK_BLOB_URL, KB_MODE=azure_blob and KB_BLOB_CONTAINER_URL
+#      in .env
+#   8. Removes what earlier versions of this script deployed: the Function App feedback-log-<suffix> (with its
+#      role assignments, Application Insights, plan and package container) and the connection feedback-mcp
 #
-# Reads PROJECT_ENDPOINT from .env. Override names with FEEDBACK_STORAGE_ACCOUNT / FEEDBACK_FUNCTION_APP.
+# Reads PROJECT_ENDPOINT from .env. Override names with TOOLS_STORAGE_ACCOUNT / TOOLS_FUNCTION_APP.
 # The next app start (or kb_eval.py run) creates a new agent version that uses the function.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -75,16 +78,22 @@ read -r RG LOCATION ACCOUNT_ID < <(az cognitiveservices account list \
   --query "[?name=='$ACCOUNT'] | [0].join(' ', [resourceGroup, location, id])" -o tsv)
 [[ -n ${ACCOUNT_ID:-} ]] || { echo "Foundry resource $ACCOUNT not found in the current subscription."; exit 1; }
 SUFFIX=$(printf %s "$ACCOUNT_ID" | sha1sum | cut -c1-8)
-STORAGE=${FEEDBACK_STORAGE_ACCOUNT:-feedbacklog$SUFFIX}
-APP=${FEEDBACK_FUNCTION_APP:-feedback-log-$SUFFIX}
+LEGACY_APP=feedback-log-$SUFFIX # the name earlier versions of this script used; step 8 removes it
+STORAGE=${TOOLS_STORAGE_ACCOUNT:-agenttools$SUFFIX}
+if [[ -z ${TOOLS_STORAGE_ACCOUNT:-} ]] && ! az storage account show -n "$STORAGE" -g "$RG" -o none 2>/dev/null \
+    && az storage account show -n "feedbacklog$SUFFIX" -g "$RG" -o none 2>/dev/null; then
+  STORAGE=feedbacklog$SUFFIX # keep the account (and the data) an earlier version of this script created
+fi
+APP=${TOOLS_FUNCTION_APP:-agent-tools-$SUFFIX}
 TABLE=feedback
 DB_CONTAINER=oracle-mock
 DB_BLOB_URL="https://$STORAGE.blob.core.windows.net/$DB_CONTAINER/demo_oracle_mock.db"
 KB_CONTAINER=knowledge-base
 KB_CONTAINER_URL="https://$STORAGE.blob.core.windows.net/$KB_CONTAINER"
 FOUNDRY_USER_ROLE=53ca6127-db72-4b80-b1b0-d745d6d5456d # Foundry User (formerly Azure AI User); IDs survive renames
-CONNECTION=feedback-mcp
-OLD_CONNECTION=feedback-function # used by the earlier OpenAPI version of this tool
+CONNECTIONS_FOR_TOOLS=(feedback-log-mcp oracle-db-mcp knowledge-base-mcp) # names agent_service.py expects
+OLD_CONNECTIONS=(feedback-mcp feedback-function) # from earlier versions (MCP, then OpenAPI)
+DEPLOY_CONTAINER=function-deploy
 echo "Foundry: $ACCOUNT / $PROJECT   resource group: $RG   region: $LOCATION"
 echo "Storage account: $STORAGE   Function App: $APP"
 
@@ -156,10 +165,10 @@ echo "$BUILD_ID" > "$BUILD/src/build_id.txt"
 # link. (`az functionapp deployment source config-zip` needs an App Service token that security defaults
 # can block without an interactive MFA sign-in.)
 az rest --method put -o none --body '{}' \
-  --url "https://management.azure.com$STORAGE_ID/blobServices/default/containers/feedback-deploy?api-version=2023-05-01"
-az storage blob upload --account-name "$STORAGE" --account-key "$STORAGE_KEY" -c feedback-deploy -n function.zip \
+  --url "https://management.azure.com$STORAGE_ID/blobServices/default/containers/$DEPLOY_CONTAINER?api-version=2023-05-01"
+az storage blob upload --account-name "$STORAGE" --account-key "$STORAGE_KEY" -c "$DEPLOY_CONTAINER" -n function.zip \
   -f "$BUILD/function.zip" --overwrite -o none --only-show-errors --no-progress
-PACKAGE_URL=$(az storage blob generate-sas --account-name "$STORAGE" --account-key "$STORAGE_KEY" -c feedback-deploy \
+PACKAGE_URL=$(az storage blob generate-sas --account-name "$STORAGE" --account-key "$STORAGE_KEY" -c "$DEPLOY_CONTAINER" \
   -n function.zip --permissions r --https-only --expiry "$(date -u -d '+1 hour' +%Y-%m-%dT%H:%MZ)" --full-uri -o tsv)
 U="$PACKAGE_URL" "$PY" -c '
 import json, os, sys
@@ -187,10 +196,10 @@ except Exception: pass')
 done
 [[ $LIVE == "$BUILD_ID" ]] || { echo "Build $BUILD_ID isn't live yet (live: ${LIVE:-none}); re-run this script in a few minutes."; exit 1; }
 echo "Build $BUILD_ID is live"
-az storage blob delete --account-name "$STORAGE" --account-key "$STORAGE_KEY" -c feedback-deploy -n function.zip \
+az storage blob delete --account-name "$STORAGE" --account-key "$STORAGE_KEY" -c "$DEPLOY_CONTAINER" -n function.zip \
   -o none --only-show-errors
 
-step "6. MCP key in a Foundry project connection"
+step "6. MCP key in Foundry project connections"
 KEY=""
 for _ in $(seq 1 18); do # the MCP extension creates its system key when it first starts
   KEY=$(az functionapp keys list -n "$APP" -g "$RG" --query "systemKeys.mcp_extension" -o tsv 2>/dev/null)
@@ -207,16 +216,14 @@ json.dump({"properties": {"category": "RemoteTool", "authType": "CustomKeys", "t
            "metadata": {"type": "generic_mcp"}}},
           open(sys.argv[1], "w"))' "$BUILD/connection.json"
 # RemoteTool + generic_mcp is what the portal's "Add tool > Custom > MCP" creates, so the portal lists the tool
-if ! az rest --method put -o none --body "@$BUILD/connection.json" --url "$CONNECTIONS/$CONNECTION?api-version=2025-06-01" \
-    2>"$BUILD/err"; then # an older Custom keys connection of the same name can't change category in place
-  az rest --method delete -o none --url "$CONNECTIONS/$CONNECTION?api-version=2025-06-01"
-  az rest --method put -o none --body "@$BUILD/connection.json" --url "$CONNECTIONS/$CONNECTION?api-version=2025-06-01"
-fi
-echo "Connection $CONNECTION holds the key (sent as the x-functions-key header)"
-if az rest --method get -o none --url "$CONNECTIONS/$OLD_CONNECTION?api-version=2025-06-01" 2>/dev/null; then
-  az rest --method delete -o none --url "$CONNECTIONS/$OLD_CONNECTION?api-version=2025-06-01"
-  echo "Removed the old connection $OLD_CONNECTION (OpenAPI version)"
-fi
+for name in "${CONNECTIONS_FOR_TOOLS[@]}"; do
+  if ! az rest --method put -o none --body "@$BUILD/connection.json" --url "$CONNECTIONS/$name?api-version=2025-06-01" \
+      2>"$BUILD/err"; then # an older connection of the same name can't change category in place
+    az rest --method delete -o none --url "$CONNECTIONS/$name?api-version=2025-06-01"
+    az rest --method put -o none --body "@$BUILD/connection.json" --url "$CONNECTIONS/$name?api-version=2025-06-01"
+  fi
+done
+echo "Connections ${CONNECTIONS_FOR_TOOLS[*]} hold the key (sent as the x-functions-key header)"
 
 step "7. MCP smoke test and .env"
 MCP_URL="https://$HOST/runtime/webhooks/mcp"
@@ -253,14 +260,56 @@ echo "query_oracle_db works: $RESULT in the mock database"
 NOKEY=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$MCP_URL" -H 'Content-Type: application/json' -d '{}')
 echo "Without the key: HTTP $NOKEY (expected 401)"
 cp -p .env ".env.bak.$(date +%Y%m%d-%H%M%S)"
-env_unset FEEDBACK_FUNCTION_URL
-env_set FEEDBACK_MCP_URL "$MCP_URL"
-env_set FEEDBACK_CONNECTION_NAME "$CONNECTION"
+for old in FEEDBACK_FUNCTION_URL FEEDBACK_MCP_URL FEEDBACK_CONNECTION_NAME; do env_unset "$old"; done
+env_set MCP_SERVER_URL "$MCP_URL"
 env_set FEEDBACK_TABLE_ENDPOINT "https://$STORAGE.table.core.windows.net"
 env_set FEEDBACK_TABLE_NAME "$TABLE"
 env_set DB_MODE azure_blob
 env_set ORACLE_MOCK_BLOB_URL "$DB_BLOB_URL"
 env_set KB_MODE azure_blob
 env_set KB_BLOB_CONTAINER_URL "$KB_CONTAINER_URL"
-echo "Wrote FEEDBACK_*, DB_MODE, ORACLE_MOCK_BLOB_URL, KB_MODE and KB_BLOB_CONTAINER_URL to .env. The next app"
-echo "start creates an agent version that uses the MCP server for log_feedback, the database tools and KB updates."
+echo "Wrote MCP_SERVER_URL, FEEDBACK_TABLE_*, DB_MODE, ORACLE_MOCK_BLOB_URL, KB_MODE and KB_BLOB_CONTAINER_URL to .env."
+
+step "8. Remove earlier deployments"
+for name in "${OLD_CONNECTIONS[@]}"; do
+  if az rest --method get -o none --url "$CONNECTIONS/$name?api-version=2025-06-01" 2>/dev/null; then
+    az rest --method delete -o none --url "$CONNECTIONS/$name?api-version=2025-06-01"
+    echo "Removed the connection $name"
+  fi
+done
+LEGACY_ID=$(az functionapp list -g "$RG" --query "[?name=='$LEGACY_APP'].id | [0]" -o tsv)
+if [[ -n $LEGACY_ID && $LEGACY_APP != "$APP" ]]; then
+  read -r LEGACY_PRINCIPAL LEGACY_PLAN LEGACY_PACKAGES < <(az rest --method get \
+    --url "https://management.azure.com$LEGACY_ID?api-version=2024-04-01" --query "join(' ', [identity.principalId || '-',
+      properties.serverFarmId, properties.functionAppConfig.deployment.storage.value || '-'])" -o tsv)
+  if [[ $LEGACY_PRINCIPAL != - ]]; then # assignments would outlive the identity as "Identity not found" rows
+    for id in $(az role assignment list --all --fill-principal-name false \
+        --query "[?principalId=='$LEGACY_PRINCIPAL'].id" -o tsv); do
+      az role assignment delete --ids "$id" -o none
+    done
+  fi
+  az functionapp delete --ids "$LEGACY_ID" -o none
+  echo "Removed the Function App $LEGACY_APP and its role assignments"
+  LEGACY_AI=$(az resource list -g "$RG" --resource-type Microsoft.Insights/components --query "[?name=='$LEGACY_APP'].id | [0]" -o tsv)
+  [[ -n $LEGACY_AI ]] && az resource delete --ids "$LEGACY_AI" -o none && echo "Removed its Application Insights"
+  if [[ $(az rest --method get --url "https://management.azure.com$LEGACY_PLAN?api-version=2024-04-01" \
+      --query properties.numberOfSites -o tsv 2>/dev/null) == 0 ]]; then
+    az rest --method delete -o none --url "https://management.azure.com$LEGACY_PLAN?api-version=2024-04-01"
+    echo "Removed its plan ${LEGACY_PLAN##*/}"
+  fi
+  NEW_PACKAGES=$(az rest --method get --url "https://management.azure.com$APP_ID?api-version=2024-04-01" \
+    --query "properties.functionAppConfig.deployment.storage.value" -o tsv)
+  if [[ $LEGACY_PACKAGES == https://$STORAGE.blob.core.windows.net/* && $LEGACY_PACKAGES != "$NEW_PACKAGES" ]]; then
+    az storage container delete --account-name "$STORAGE" --account-key "$STORAGE_KEY" -n "${LEGACY_PACKAGES##*/}" -o none
+    echo "Removed its package container ${LEGACY_PACKAGES##*/}"
+  fi
+  az storage blob delete-batch --account-name "$STORAGE" --account-key "$STORAGE_KEY" -s azure-webjobs-secrets \
+    --pattern "$LEGACY_APP/*" -o none --only-show-errors # its function keys
+fi
+if [[ $(az storage container exists --account-name "$STORAGE" --account-key "$STORAGE_KEY" -n feedback-deploy \
+    --query exists -o tsv) == true ]]; then
+  az storage container delete --account-name "$STORAGE" --account-key "$STORAGE_KEY" -n feedback-deploy -o none
+  echo "Removed the old staging container feedback-deploy"
+fi
+echo
+echo "Done. The next app start (or kb_eval.py run) creates an agent version that uses $MCP_URL"

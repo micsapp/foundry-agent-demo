@@ -322,7 +322,7 @@ with tab_arch:
            - **KB Guardrail** checks for path traversal, scans for accidental PII/secrets (`SSN`, `sk-...` API keys), generates a `difflib` unified diff, and answers the agent's `function_call` with `PENDING_HITL` until a human clicks **Approve**.
            - Upon approval, the tool writes the updated Markdown file, uploads it to the agent's vector store via `vector_stores.files.upload_and_poll`, removes the outdated `file_id`, and tells the agent the outcome on the next turn.
         4. **Feedback Log Tool (`log_feedback`):**
-           - When the Knowledge Base can't answer a question, or a user reports a problem, the agent calls this tool. With `deploy_feedback_function.sh` set up, it's an **MCP tool** that Foundry calls itself: an Azure Function (MCP server) writes the entry to an Azure Table, so it works in the portal playground too. Otherwise it's a `FunctionTool` and the app appends to `feedback_log.jsonl`.
+           - When the Knowledge Base can't answer a question, or a user reports a problem, the agent calls this tool. With `deploy_mcp_tools.sh` set up, it's an **MCP tool** that Foundry calls itself: an Azure Function (MCP server) writes the entry to an Azure Table, so it works in the portal playground too. Otherwise it's a `FunctionTool` and the app appends to `feedback_log.jsonl`.
            - The log is append-only and the agent never reads it back, so no approval is needed; SSNs, API keys and passwords are masked first.
         """
     )

@@ -1239,7 +1239,7 @@ menu_feedback() {
     echo "  3) List problem reports"
     echo "  4) Show one entry in full"
     echo "  5) Delete an entry"
-    echo "  6) Deploy or update the Azure Function (feedback log + DB tools)"
+    echo "  6) Deploy or update the Azure Function (MCP tools, deploy_mcp_tools.sh)"
     echo "  0) ← Back"
     [[ -n $FB_ACCOUNT ]] || echo -e "  ${DIM}No feedback table in .env yet, so this shows the app's local file; option 6 sets up the table.${RESET}"
     echo
@@ -1333,8 +1333,8 @@ fb_deploy() {
   need_login || return
   info "Creates or updates the function, its table and the Foundry connection, then writes FEEDBACK_* to .env."
   info "Safe to re-run. The next app start (or eval) creates an agent version that uses it, if needed."
-  confirm "Run deploy_feedback_function.sh?" || return
-  run_in_project bash deploy_feedback_function.sh
+  confirm "Run deploy_mcp_tools.sh?" || return
+  run_in_project bash deploy_mcp_tools.sh
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

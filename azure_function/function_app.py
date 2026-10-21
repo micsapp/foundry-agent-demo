@@ -16,7 +16,7 @@ system key, which it keeps in a Foundry project connection, not in code. Storage
 Function App's managed identity. Because Foundry calls the server itself, the tools also work in the portal
 playground, and MCP is a tool type gpt-5-mini supports.
 
-Deployed by ../deploy_feedback_function.sh, which copies feedback_log.py, oracle_tool.py, kb_tool.py and
+Deployed by ../deploy_mcp_tools.sh, which copies feedback_log.py, oracle_tool.py, kb_tool.py and
 guardrails.py next to this file so masking, guardrails and the storage code match the Streamlit app exactly, and writes
 build_id.txt so the script can tell when the new code is live (GET /api/health returns it).
 """

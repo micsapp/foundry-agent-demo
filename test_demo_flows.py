@@ -17,7 +17,7 @@ from feedback_log import FeedbackLog
 
 
 def run_all_tests() -> None:
-    orch = FoundryAgentOrchestrator(agent_mode="demo", db_mode="sqlite_mock")
+    orch = FoundryAgentOrchestrator(agent_mode="demo", db_mode="sqlite_mock", kb_mode="local")
     orch.kb_tool.reset_kb_files()
     orch.oracle_tool.reset_demo_db()
 

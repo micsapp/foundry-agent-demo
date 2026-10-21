@@ -6,7 +6,7 @@ Two stores share one entry format:
   app itself runs the `log_feedback` tool.
 - `TableFeedbackLog`: an Azure Table. The `azure_function/` app writes here when Foundry calls
   `log_feedback` as an OpenAPI tool, which also works in the Foundry portal playground; the Streamlit
-  app reads the same table. Set FEEDBACK_TABLE_ENDPOINT to use it (`deploy_feedback_function.sh` does).
+  app reads the same table. Set FEEDBACK_TABLE_ENDPOINT to use it (`deploy_mcp_tools.sh` does).
 
 The log is append-only and nothing the agent reads comes from it, so writing an entry needs no
 Human-in-the-Loop approval. SSNs, API keys and passwords are masked before anything is written.

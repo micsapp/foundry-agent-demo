@@ -196,7 +196,7 @@ class OracleDatabaseTool:
     def _blob_client(self) -> Any:
         if self._blob is None:
             if not self.blob_url:
-                raise RuntimeError("ORACLE_MOCK_BLOB_URL is not set; ./deploy_feedback_function.sh writes it to .env.")
+                raise RuntimeError("ORACLE_MOCK_BLOB_URL is not set; ./deploy_mcp_tools.sh writes it to .env.")
             from azure.identity import DefaultAzureCredential
             from azure.storage.blob import BlobClient
 
