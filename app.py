@@ -324,8 +324,13 @@ with tab_arch:
         4. **Feedback Log Tool (`log_feedback`):**
            - When the Knowledge Base can't answer a question, or a user reports a problem, the agent calls this tool. With `deploy_mcp_tools.sh` set up, it's an **MCP tool** that Foundry calls itself: an Azure Function (MCP server) writes the entry to an Azure Table, so it works in the portal playground too. Otherwise it's a `FunctionTool` and the app appends to `feedback_log.jsonl`.
            - The log is append-only and the agent never reads it back, so no approval is needed; SSNs, API keys and passwords are masked first.
+        5. **Public Chat Page (no sign-in):**
+           - The Azure Function also serves a chat page at `/api/chat` for a second, read-only agent (`Oracle-And-KB-Public-Agent`: File Search, `query_oracle_db` and `log_feedback`, no approvals). This app creates it next to the main agent when the DB tools run on the function.
+           - Visitors don't sign in, so the function calls Foundry as its own identity and caps use per visitor and per day (Function App settings `CHAT_PER_VISITOR_PER_HOUR`, `CHAT_DAILY_LIMIT`).
         """
     )
+    if os.getenv("MCP_SERVER_URL", "").strip():
+        st.markdown(f"Public chat page: {os.getenv('MCP_SERVER_URL').strip().split('/runtime/')[0]}/api/chat")
 
 # ----------------------------------------------------------------------------
 # Tab 1: Interactive Agent Chat & One-Click Scenarios

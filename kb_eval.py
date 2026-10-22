@@ -10,7 +10,8 @@ checks each answer for the expected facts.
 Uses the AGENT_MODE from .env. Meant for AGENT_MODE=foundry: demo mode only does a local keyword
 lookup, so most answers there won't pass. Each question gets a fresh Foundry conversation so
 earlier answers can't help later ones. Like the Streamlit app, it reuses the project's vector
-store and agent version, uploading only Knowledge Base files that changed.
+store and agent versions (the main agent's and the public chat page's), uploading only Knowledge Base
+files that changed.
 
 Questions the Knowledge Base can't answer must also be logged with `log_feedback`. The entries the
 agent logs during the eval are removed from the feedback log at the end (add --keep-log to keep them).

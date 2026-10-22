@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
 # Deploys the Azure Function that serves the agent's log_feedback, query_oracle_db, update_oracle_incident and
 # propose_kb_file_update tools as an MCP server, which Foundry calls itself (so they also work in the Foundry
-# portal playground). Safe to re-run: existing resources are reused and the code is redeployed.
+# portal playground), and a public chat page (no sign-in) for a read-only agent. Safe to re-run: existing
+# resources are reused and the code is redeployed.
 #
 #   1. Storage account in the Foundry resource's group and region, with the Azure Table "feedback", the blob
 #      container "oracle-mock" (the mock Oracle database, a SQLite file the function creates on first use) and the
 #      blob container "knowledge-base" (seeded from knowledge_base/ and .kb_vector_store.json; files already
 #      there are kept, so edits made through the agent survive a re-run)
-#   2. Function App (Flex Consumption, Python) with a system-assigned managed identity
+#   2. Function App (Flex Consumption, Python, at most 10 instances) with a system-assigned managed identity
 #   3. For the Function App and for you: Storage Table Data Contributor on the storage account and Storage Blob
 #      Data Contributor on both containers; for the Function App also Foundry User on the Foundry resource, so it
 #      can re-index updated KB files in the vector store
-#   4. Code from azure_function/ plus feedback_log.py, oracle_tool.py, kb_tool.py and guardrails.py, built remotely
+#   4. Code from azure_function/ (including the chat page in public/) plus feedback_log.py, oracle_tool.py,
+#      kb_tool.py and guardrails.py, built remotely
 #   5. Waits until the new build answers on /api/health
 #   6. The app's mcp_extension system key, stored only in the Foundry MCP ("remote tool") connections
 #      feedback-log-mcp, oracle-db-mcp and knowledge-base-mcp (one per tool group, so the portal tells them apart)
 #   7. MCP smoke test (lists the tools, runs one read-only query), then MCP_SERVER_URL, FEEDBACK_TABLE_ENDPOINT,
 #      FEEDBACK_TABLE_NAME, DB_MODE=azure_blob, ORACLE_MOCK_BLOB_URL, KB_MODE=azure_blob and KB_BLOB_CONTAINER_URL
 #      in .env
-#   8. Removes what earlier versions of this script deployed: the Function App feedback-log-<suffix> (with its
+#   8. Creates or reuses the agent versions, as an app start does: the main agent and the public chat page's
+#      read-only agent (File Search, query_oracle_db and log_feedback only). Then checks the page at /api/chat
+#   9. Removes what earlier versions of this script deployed: the Function App feedback-log-<suffix> (with its
 #      role assignments, Application Insights, plan and package container) and the connection feedback-mcp
 #
 # Reads PROJECT_ENDPOINT from .env. Override names with TOOLS_STORAGE_ACCOUNT / TOOLS_FUNCTION_APP.
-# The next app start (or kb_eval.py run) creates a new agent version that uses the function.
+# The chat page's limits are app settings (see azure_function/public_chat.py), e.g.
+#   az functionapp config appsettings set -n <app> -g <group> --settings CHAT_DAILY_LIMIT=200
 set -euo pipefail
 cd "$(dirname "$0")"
 PY=.venv/bin/python; [[ -x $PY ]] || PY=python3
@@ -78,7 +83,7 @@ read -r RG LOCATION ACCOUNT_ID < <(az cognitiveservices account list \
   --query "[?name=='$ACCOUNT'] | [0].join(' ', [resourceGroup, location, id])" -o tsv)
 [[ -n ${ACCOUNT_ID:-} ]] || { echo "Foundry resource $ACCOUNT not found in the current subscription."; exit 1; }
 SUFFIX=$(printf %s "$ACCOUNT_ID" | sha1sum | cut -c1-8)
-LEGACY_APP=feedback-log-$SUFFIX # the name earlier versions of this script used; step 8 removes it
+LEGACY_APP=feedback-log-$SUFFIX # the name earlier versions of this script used; step 9 removes it
 STORAGE=${TOOLS_STORAGE_ACCOUNT:-agenttools$SUFFIX}
 if [[ -z ${TOOLS_STORAGE_ACCOUNT:-} ]] && ! az storage account show -n "$STORAGE" -g "$RG" -o none 2>/dev/null \
     && az storage account show -n "feedbacklog$SUFFIX" -g "$RG" -o none 2>/dev/null; then
@@ -136,9 +141,14 @@ if ! az functionapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
     --runtime python --runtime-version 3.13 --instance-memory 512 --maximum-instance-count 10 -o none
 fi
 APP_PRINCIPAL=$(az functionapp identity assign -n "$APP" -g "$RG" --query principalId -o tsv)
+PUBLIC_AGENT=$("$PY" -c 'from agent_service import PUBLIC_AGENT_NAME; print(PUBLIC_AGENT_NAME)')
+# Salt for the chat page's visitor hashes; kept across re-runs so the hourly counts carry on
+SALT=$(az functionapp config appsettings list -n "$APP" -g "$RG" --query "[?name=='CHAT_VISITOR_SALT'].value | [0]" -o tsv)
+[[ -n $SALT ]] || SALT=$(openssl rand -hex 16)
 az functionapp config appsettings set -n "$APP" -g "$RG" -o none --settings \
   "FEEDBACK_TABLE_ENDPOINT=https://$STORAGE.table.core.windows.net" "FEEDBACK_TABLE_NAME=$TABLE" \
-  "ORACLE_MOCK_BLOB_URL=$DB_BLOB_URL" "KB_BLOB_CONTAINER_URL=$KB_CONTAINER_URL" "PROJECT_ENDPOINT=$ENDPOINT"
+  "ORACLE_MOCK_BLOB_URL=$DB_BLOB_URL" "KB_BLOB_CONTAINER_URL=$KB_CONTAINER_URL" "PROJECT_ENDPOINT=$ENDPOINT" \
+  "PUBLIC_CHAT_AGENT=$PUBLIC_AGENT" "CHAT_VISITOR_SALT=$SALT"
 read -r APP_ID HOST < <(az functionapp show -n "$APP" -g "$RG" \
   --query "join(' ', [id, properties.defaultHostName || defaultHostName])" -o tsv)
 
@@ -156,9 +166,9 @@ step "4. Deploy code"
 BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 mkdir "$BUILD/src"
-cp azure_function/function_app.py azure_function/host.json azure_function/requirements.txt \
-  feedback_log.py oracle_tool.py kb_tool.py guardrails.py "$BUILD/src/"
-BUILD_ID=$(cat "$BUILD"/src/* | sha256sum | cut -c1-12)
+cp -r azure_function/function_app.py azure_function/public_chat.py azure_function/public azure_function/host.json \
+  azure_function/requirements.txt feedback_log.py oracle_tool.py kb_tool.py guardrails.py "$BUILD/src/"
+BUILD_ID=$(cd "$BUILD/src" && find . -type f | sort | xargs cat | sha256sum | cut -c1-12)
 echo "$BUILD_ID" > "$BUILD/src/build_id.txt"
 (cd "$BUILD/src" && zip -qr ../function.zip .)
 # Deploy through Azure Resource Manager: the onedeploy extension pulls the package from a one-hour read-only
@@ -270,7 +280,26 @@ env_set KB_MODE azure_blob
 env_set KB_BLOB_CONTAINER_URL "$KB_CONTAINER_URL"
 echo "Wrote MCP_SERVER_URL, FEEDBACK_TABLE_*, DB_MODE, ORACLE_MOCK_BLOB_URL, KB_MODE and KB_BLOB_CONTAINER_URL to .env."
 
-step "8. Remove earlier deployments"
+step "8. Agent versions and the public chat page"
+"$PY" - <<'EOF'
+import os, sys
+from dotenv import load_dotenv
+load_dotenv(".env", override=True)
+from agent_service import FoundryAgentOrchestrator
+orch = FoundryAgentOrchestrator(agent_mode="foundry", db_mode=os.getenv("DB_MODE", "sqlite_mock"))
+if not orch.foundry_agent_name or orch.public_agent_status.startswith(("failed", "not created")):
+    sys.exit(f"Couldn't set up the agents: {orch.foundry_status}")
+print(f"Agent {orch.foundry_agent_name} v{orch.foundry_agent_version}; public chat agent {orch.public_agent_status}")
+EOF
+CHAT_URL="https://$HOST/api/chat"
+PAGE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$CHAT_URL")
+# An empty message is refused before the agent runs, after the visitor counter (Azure Table) is updated
+EMPTY=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST -H 'Content-Type: application/json' \
+  -d '{"message": ""}' "$CHAT_URL/message")
+[[ $PAGE == 200 && $EMPTY == 400 ]] || { echo "Chat page check failed (page: HTTP $PAGE, empty message: HTTP $EMPTY)"; exit 1; }
+echo "Public chat page: $CHAT_URL"
+
+step "9. Remove earlier deployments"
 for name in "${OLD_CONNECTIONS[@]}"; do
   if az rest --method get -o none --url "$CONNECTIONS/$name?api-version=2025-06-01" 2>/dev/null; then
     az rest --method delete -o none --url "$CONNECTIONS/$name?api-version=2025-06-01"
@@ -312,4 +341,5 @@ if [[ $(az storage container exists --account-name "$STORAGE" --account-key "$ST
   echo "Removed the old staging container feedback-deploy"
 fi
 echo
-echo "Done. The next app start (or kb_eval.py run) creates an agent version that uses $MCP_URL"
+echo "Done. MCP server: $MCP_URL"
+echo "Public chat page (no sign-in): $CHAT_URL"

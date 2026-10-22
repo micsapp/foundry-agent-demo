@@ -16,6 +16,9 @@ system key, which it keeps in a Foundry project connection, not in code. Storage
 Function App's managed identity. Because Foundry calls the server itself, the tools also work in the portal
 playground, and MCP is a tool type gpt-5-mini supports.
 
+It also serves a public chat page, GET /api/chat, where anyone can talk to a read-only agent without signing in
+(public_chat.py has the limits and safeguards).
+
 Deployed by ../deploy_mcp_tools.sh, which copies feedback_log.py, oracle_tool.py, kb_tool.py and
 guardrails.py next to this file so masking, guardrails and the storage code match the Streamlit app exactly, and writes
 build_id.txt so the script can tell when the new code is live (GET /api/health returns it).
@@ -32,6 +35,7 @@ from feedback_log import FEEDBACK_KINDS, TableFeedbackLog
 from guardrails import GuardrailEngine
 from kb_tool import KnowledgeBaseTool
 from oracle_tool import OracleDatabaseTool
+from public_chat import default_chat
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 _store = None
@@ -152,3 +156,42 @@ def propose_kb_file_update(filename: str, updated_content: str, change_summary: 
 def health(req: func.HttpRequest) -> func.HttpResponse:
     """Reports the deployed build so the deploy script knows when new code is live. Reveals nothing else."""
     return func.HttpResponse(json.dumps({"build": BUILD_ID}), mimetype="application/json")
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Public chat page (no sign-in) for the read-only agent; limits and safeguards are described in public_chat.py
+# ----------------------------------------------------------------------------------------------------------------
+_PUBLIC_DIR = Path(__file__).with_name("public")
+_chat = default_chat()
+_PAGE_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.route(route="chat", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def chat_page(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(
+        (_PUBLIC_DIR / "chat.html").read_bytes(), mimetype="text/html", charset="utf-8", headers=_PAGE_HEADERS
+    )
+
+
+@app.route(route="chat/app.js", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def chat_script(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(
+        (_PUBLIC_DIR / "chat.js").read_bytes(), mimetype="text/javascript", charset="utf-8",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.route(route="chat/message", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def chat_message(req: func.HttpRequest) -> func.HttpResponse:
+    status, payload = _chat.handle(req.get_body(), {k.lower(): v for k, v in req.headers.items()})
+    return func.HttpResponse(
+        json.dumps(payload), status_code=status, mimetype="application/json",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )

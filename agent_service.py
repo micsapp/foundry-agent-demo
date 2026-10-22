@@ -3,8 +3,10 @@ Microsoft Foundry Agent Orchestrator with Action Guardrails & Human-in-the-Loop 
 
 Supports two execution modes:
 1. `foundry`: Uses the `azure-ai-projects` 2.x SDK against a Foundry project endpoint (`PROJECT_ENDPOINT`).
-   It creates a prompt agent (`PromptAgentDefinition` with `FileSearchTool` + `FunctionTool`s) and runs it
-   through the OpenAI Responses API (conversations + `agent_reference`), with every function call guarded.
+   It creates a prompt agent (`PromptAgentDefinition` with `FileSearchTool` plus `FunctionTool`s, or MCP tools on
+   the Azure Function when MCP_SERVER_URL is set) and runs it through the OpenAI Responses API (conversations +
+   `agent_reference`), with every function call guarded and every MCP approval request reviewed. With the
+   database tools on the function it also creates the read-only agent behind the function's public chat page.
 2. `demo`: Works out-of-the-box locally (without requiring Azure credentials first) to demonstrate
    the exact same tool call lifecycle, SQL & KB guardrails, and Human-in-the-Loop approval flow.
 """
@@ -24,6 +26,8 @@ from kb_tool import KnowledgeBaseTool
 from oracle_tool import OracleDatabaseTool
 
 FOUNDRY_AGENT_NAME = "Oracle-And-KB-Guarded-Agent"
+# Read-only agent behind the Function App's public chat page (no sign-in), created alongside the main agent
+PUBLIC_AGENT_NAME = "Oracle-And-KB-Public-Agent"
 KB_VECTOR_STORE_NAME = "Enterprise-Oracle-KB-Store"
 MAX_TOOL_ROUNDS = 8  # function-call round trips allowed in one user turn
 ORACLE_MCP_TOOLS = ("query_oracle_db", "update_oracle_incident")  # served by the Azure Function in azure_blob mode
@@ -208,14 +212,23 @@ def feedback_mcp_tool(server_url: str) -> Any:
     )
 
 
-def oracle_mcp_tool(server_url: str) -> Any:
+def oracle_mcp_tool(server_url: str, read_only: bool = False) -> Any:
     """`query_oracle_db` and `update_oracle_incident` from the same MCP server, working on the blob database.
 
     Foundry holds every `update_oracle_incident` call until someone approves it: the app shows its approval card
     and answers with an mcp_approval_response, and the portal playground shows its own approve/deny prompt.
+    With `read_only`, Foundry offers the agent only `query_oracle_db`.
     """
     from azure.ai.projects.models import MCPTool, MCPToolFilter, MCPToolRequireApproval
 
+    if read_only:
+        return MCPTool(
+            server_label="oracle_db",
+            server_url=server_url,
+            allowed_tools=MCPToolFilter(tool_names=["query_oracle_db"]),
+            require_approval="never",
+            project_connection_id=MCP_CONNECTIONS["oracle_db"],
+        )
     return MCPTool(
         server_label="oracle_db",
         server_url=server_url,
@@ -245,12 +258,8 @@ def knowledge_base_mcp_tool(server_url: str) -> Any:
     )
 
 
-FOUNDRY_AGENT_INSTRUCTIONS = (
-    "You are an Enterprise Operations AI Agent built on Microsoft Foundry. "
-    "You answer questions using the Knowledge Base (File Search), query the Oracle DB "
-    "using `query_oracle_db`, update incidents using `update_oracle_incident`, "
-    "update Knowledge Base files using `propose_kb_file_update`, and record gaps and problems using "
-    "`log_feedback`. "
+# Rules both agents share: answering from the Knowledge Base, logging gaps and problems, no web access
+_KB_AND_FEEDBACK_RULES = (
     "The Knowledge Base also holds product manuals (PDF). For questions about them, answer only from "
     "what File Search returns: quote exact values (ports, limits, codes, versions), name the source "
     "document, keep products apart, and if the Knowledge Base doesn't contain the answer, say so "
@@ -263,11 +272,44 @@ FOUNDRY_AGENT_INSTRUCTIONS = (
     "keys and personal data out of log entries. "
     "You have no web access: never offer to search the internet, check vendor websites, or look up "
     "outside sources. "
-    "When a tool returns status PENDING_HITL, tell the user the change is waiting for a human "
+)
+FOUNDRY_AGENT_INSTRUCTIONS = (
+    "You are an Enterprise Operations AI Agent built on Microsoft Foundry. "
+    "You answer questions using the Knowledge Base (File Search), query the Oracle DB "
+    "using `query_oracle_db`, update incidents using `update_oracle_incident`, "
+    "update Knowledge Base files using `propose_kb_file_update`, and record gaps and problems using "
+    "`log_feedback`. "
+    + _KB_AND_FEEDBACK_RULES
+    + "When a tool returns status PENDING_HITL, tell the user the change is waiting for a human "
     "operator's approval and don't call the tool again. Messages starting with [Operator update] "
     "report the operator's approval decisions. Approvals happen only in the operator's approval step, never "
     "in the chat: if a change is rejected, say it wasn't made and don't ask the user to approve it by replying."
 )
+PUBLIC_AGENT_INSTRUCTIONS = (
+    "You are the public, read-only demo of an Enterprise Operations AI Agent built on Microsoft Foundry. "
+    "Anyone can chat with you without signing in. You answer questions using the Knowledge Base (File Search), "
+    "query the Oracle DB using `query_oracle_db`, and record gaps and problems using `log_feedback`. "
+    + _KB_AND_FEEDBACK_RULES
+    + "You can't change anything: if someone asks you to update an incident, a database record or a Knowledge "
+    "Base file, say this public demo is read-only and the operations team makes changes in the staff version of "
+    "this assistant. Never claim a change was made."
+)
+
+
+def public_agent_definition(model: str, vector_store_id: str, mcp_url: str) -> Any:
+    """The read-only agent behind the public chat page: File Search, `query_oracle_db` and `log_feedback`, none of
+    which needs an approval, so the page never has to answer one."""
+    from azure.ai.projects.models import FileSearchTool, PromptAgentDefinition
+
+    return PromptAgentDefinition(
+        model=model,
+        instructions=PUBLIC_AGENT_INSTRUCTIONS,
+        tools=[
+            FileSearchTool(vector_store_ids=[vector_store_id]),
+            oracle_mcp_tool(mcp_url, read_only=True),
+            feedback_mcp_tool(mcp_url),
+        ],
+    )
 
 
 def _trace_arguments(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -303,6 +345,7 @@ class FoundryAgentOrchestrator:
         self.openai_client: Optional[Any] = None
         self.foundry_agent_name: Optional[str] = None
         self.foundry_agent_version: Optional[str] = None
+        self.public_agent_status: str = "not created"  # the public chat page's read-only agent
         self.foundry_conversation_id: Optional[str] = None
         self.foundry_status: str = "Not connected — using local demo mode."
         # Approval decisions made since the last Foundry turn, sent to the agent with the next message
@@ -366,6 +409,17 @@ class FoundryAgentOrchestrator:
             agent_name, agent_version, agent_how = self._get_or_create_agent_version(definition)
             self.foundry_agent_name = agent_name
             self.foundry_agent_version = agent_version
+            self.public_agent_status = "not created"
+            if self.db_via_function:  # its tools all run on the function
+                try:
+                    _, public_version, public_how = self._get_or_create_agent_version(
+                        public_agent_definition(definition.model, self.kb_tool.vector_store_id, mcp_url),
+                        agent_name=PUBLIC_AGENT_NAME,
+                        description="Read-only agent behind the public chat page (no sign-in).",
+                    )
+                    self.public_agent_status = f"{PUBLIC_AGENT_NAME} v{public_version} ({public_how})"
+                except Exception as exc:  # the main agent works without it
+                    self.public_agent_status = f"failed: {type(exc).__name__}: {exc}"
             self.foundry_conversation_id = self.openai_client.conversations.create().id
             # Calls Foundry held in the previous conversation can no longer be answered
             for action_id in [a for a, act in self.pending_actions.items() if act.foundry_approval_request_id]:
@@ -376,7 +430,7 @@ class FoundryAgentOrchestrator:
             self.foundry_status = (
                 f"Connected to {endpoint} — agent {agent_name} v{agent_version} ({agent_how}), {store_status}, "
                 f"feedback log: {feedback_where}, database tools: {db_where} ({self.oracle_tool.location}), "
-                f"KB updates: {kb_where} ({self.kb_tool.location})."
+                f"KB updates: {kb_where} ({self.kb_tool.location}), public chat agent: {self.public_agent_status}."
             )
         except Exception as exc:
             # Fall back to demo mode if credentials, roles, or the endpoint aren't ready yet
@@ -392,20 +446,23 @@ class FoundryAgentOrchestrator:
     # ========================================================================
     # Main Chat Entrypoint
     # ========================================================================
-    def _get_or_create_agent_version(self, definition: Any) -> Tuple[str, str, str]:
+    def _get_or_create_agent_version(
+        self,
+        definition: Any,
+        agent_name: str = FOUNDRY_AGENT_NAME,
+        description: str = "Oracle DB + Knowledge Base agent with guarded, human-approved actions.",
+    ) -> Tuple[str, str, str]:
         """Reuses the agent's latest version if its definition is unchanged; otherwise creates a new version."""
         from azure.core.exceptions import ResourceNotFoundError
 
         try:
-            latest = self.project_client.agents.get(agent_name=FOUNDRY_AGENT_NAME).as_dict()["versions"]["latest"]
+            latest = self.project_client.agents.get(agent_name=agent_name).as_dict()["versions"]["latest"]
             if latest.get("definition") == definition.as_dict():
                 return latest["name"], latest["version"], "reused"
         except ResourceNotFoundError:
             pass  # first run in this project
         agent = self.project_client.agents.create_version(
-            agent_name=FOUNDRY_AGENT_NAME,
-            definition=definition,
-            description="Oracle DB + Knowledge Base agent with guarded, human-approved actions.",
+            agent_name=agent_name, definition=definition, description=description
         )
         return agent.name, agent.version, "new version"
 

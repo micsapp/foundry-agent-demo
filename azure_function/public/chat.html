@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Operations Assistant</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #1c2230; --muted: #5c6575; --border: #dde2ea;
+    --accent: #2456d3; --accent-text: #ffffff; --user: #e7edfb; --chip: #eef1f5; --error: #b42318;
+    --error-bg: #fdecea; --info-bg: #eef4ff; --code: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111419; --panel: #1a1f27; --text: #e5e8ee; --muted: #98a1b0; --border: #2a313c;
+      --accent: #7096ff; --accent-text: #0b1020; --user: #233049; --chip: #232a35; --error: #ff9b8f;
+      --error-bg: #3a1d1b; --info-bg: #1c2638; --code: #232a35;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    border-bottom: 1px solid var(--border); background: var(--panel);
+    padding: 12px 16px; display: flex; align-items: center; gap: 12px;
+  }
+  header .titles { flex: 1; min-width: 0; }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  button {
+    font: inherit; border-radius: 8px; border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); padding: 7px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .55; cursor: default; }
+  main { flex: 1; overflow-y: auto; }
+  .column { max-width: 760px; margin: 0 auto; padding: 20px 16px; }
+  #intro h2 { font-size: 20px; margin: 8px 0 6px; font-weight: 600; }
+  #intro p { color: var(--muted); margin: 0 0 16px; }
+  .suggestions { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+  .suggestions button { text-align: left; padding: 10px 12px; color: var(--text); }
+  .msg { margin: 0 0 16px; display: flex; flex-direction: column; }
+  .msg .body { padding: 10px 14px; border-radius: 12px; max-width: 100%; overflow-wrap: anywhere; }
+  .msg.user { align-items: flex-end; }
+  .msg.user .body { background: var(--user); white-space: pre-wrap; max-width: 85%; }
+  .msg.assistant .body { background: var(--panel); border: 1px solid var(--border); }
+  .msg .body > :first-child { margin-top: 0; }
+  .msg .body > :last-child { margin-bottom: 0; }
+  .msg .body table { border-collapse: collapse; display: block; overflow-x: auto; margin: 8px 0; font-size: 14px; }
+  .msg .body th, .msg .body td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+  .msg .body code { background: var(--code); padding: 1px 4px; border-radius: 4px; font-size: 13px; }
+  .msg .body pre { background: var(--code); padding: 10px; border-radius: 8px; overflow-x: auto; }
+  .msg .body pre code { padding: 0; }
+  .msg .body a { color: var(--accent); }
+  .tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .chip { background: var(--chip); color: var(--muted); font-size: 12px; padding: 2px 8px; border-radius: 999px; }
+  .note { font-size: 14px; padding: 8px 12px; border-radius: 8px; margin: 0 0 16px; }
+  .note.error { background: var(--error-bg); color: var(--error); }
+  .note.info { background: var(--info-bg); color: var(--muted); }
+  .thinking .body { color: var(--muted); }
+  .dots span { animation: blink 1.4s infinite both; }
+  .dots span:nth-child(2) { animation-delay: .2s; }
+  .dots span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .2; } 40% { opacity: 1; } }
+  footer { border-top: 1px solid var(--border); background: var(--panel); }
+  footer .column { padding: 12px 16px; }
+  form { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; max-height: 160px;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #send { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  .fineprint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <div class="titles">
+    <h1>Operations Assistant</h1>
+    <p>Public demo · read-only · no sign-in</p>
+  </div>
+  <button type="button" id="new-chat">New chat</button>
+</header>
+<main id="scroller">
+  <div class="column" id="log" aria-live="polite">
+    <section id="intro">
+      <h2>Ask about incidents, SLAs and the product manuals</h2>
+      <p>Answers come from the team's knowledge base and a demo incident database. This assistant can look things up but can't change anything.</p>
+      <div class="suggestions">
+        <button type="button" data-q="What is the response SLA for a P1 incident, and who is it escalated to?">What is the response SLA for a P1 incident?</button>
+        <button type="button" data-q="Which incidents are still open, and which department owns each one?">Which incidents are still open?</button>
+        <button type="button" data-q="How do I fix ORA-01555 (snapshot too old)?">How do I fix ORA-01555?</button>
+        <button type="button" data-q="Which port does the Quorvia MQ admin console listen on?">Which port does the Quorvia MQ admin console use?</button>
+      </div>
+    </section>
+  </div>
+</main>
+<footer>
+  <div class="column">
+    <form id="composer">
+      <textarea id="input" rows="1" maxlength="1000" placeholder="Ask a question…" aria-label="Your message"></textarea>
+      <button type="submit" id="send">Send</button>
+    </form>
+    <p class="fineprint">Demo data only. Please don't enter personal information. Questions it can't answer are logged for the team to review.</p>
+  </div>
+</footer>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js" integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="/api/chat/app.js"></script>
+</body>
+</html>

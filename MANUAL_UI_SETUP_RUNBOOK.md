@@ -130,3 +130,21 @@ Switch back to the **`💬 Agent Chat & HITL Approvals`** tab and click the top 
      3. Click the **`✅ Approve & Execute`** button on both cards.
      4. Click the **`📚 Live Knowledge Base Files`** tab and **`🗄️ Live Oracle DB Inspector`** tab to show that `oracle_db_runbook.md` now includes the new `ORA-12514` section and `INC-1042` is now **`RESOLVED`**!
      5. To reset everything for the next demo session, click **`🔄 Reset KB Files`** and **`🔄 Reset Oracle DB`** in the left sidebar.
+
+---
+
+## Part 3: Sharing the Agent Outside Your Machine
+
+Neither option below needs this machine or the Streamlit app running.
+
+### Option A: Foundry's preview link (sign-in required)
+1. In the **[Foundry portal](https://ai.azure.com)**, open the agent `Oracle-And-KB-Guarded-Agent` and select **Publish**.
+2. Choose the preview link. It looks like `https://ai.azure.com/nextgen/agents/<id>/preview?version=<n>`.
+3. Anyone opening it signs in with an Azure account that has access to the agent. This is the full agent: Foundry holds incident and Knowledge Base updates until they're approved, so try one update there and check the page shows an approve/deny prompt before relying on it.
+4. The link names one agent version. When the app or `deploy_mcp_tools.sh` creates a new version (for example after the instructions change), select **Publish Updates** and share the link it gives.
+
+### Option B: Public chat page (no sign-in)
+1. Run `./deploy_mcp_tools.sh` (or `./az_tui.sh` → 10 → 6). It ends with `Public chat page (no sign-in): https://agent-tools-<suffix>.azurewebsites.net/api/chat`.
+2. Share that address. Visitors chat with `Oracle-And-KB-Public-Agent`, a read-only copy: it answers from the Knowledge Base, runs read-only database queries and logs questions it can't answer, but can't change anything.
+3. Visitors spend your subscription's credit. Each visitor gets 20 messages an hour and everyone together 100 replies a day; change these in the Azure portal under the Function App → **Settings → Environment variables** (`CHAT_PER_VISITOR_PER_HOUR`, `CHAT_DAILY_LIMIT`, `CHAT_MAX_MESSAGE_CHARS`).
+4. Questions the page couldn't answer show up in the Streamlit app's **Feedback Log** tab like any other entry.

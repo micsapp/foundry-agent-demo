@@ -3,11 +3,13 @@ Removes Foundry objects this demo leaves behind in your project.
 
     python3 foundry_cleanup.py              # show what exists and what would be removed (changes nothing)
     python3 foundry_cleanup.py --yes        # remove old agent versions, unused KB vector stores and old files
-    python3 foundry_cleanup.py --all --yes  # remove everything the demo created, including the agent and the
-                                            # vector store in use; the next run uploads everything again
+    python3 foundry_cleanup.py --all --yes  # remove everything the demo created, including both agents and the
+                                            # vector store in use; the next run uploads everything again (the
+                                            # public chat page is down until then)
 
-Only touches the agent named Oracle-And-KB-Guarded-Agent, vector stores named Enterprise-Oracle-KB-Store,
-and uploaded files named like the Knowledge Base files. Conversations can't be listed, so they're left alone.
+Only touches the agents named Oracle-And-KB-Guarded-Agent and Oracle-And-KB-Public-Agent (the public chat page's),
+vector stores named Enterprise-Oracle-KB-Store, and uploaded files named like the Knowledge Base files.
+Conversations can't be listed, so they're left alone.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-from agent_service import FOUNDRY_AGENT_NAME, KB_VECTOR_STORE_NAME
+from agent_service import FOUNDRY_AGENT_NAME, KB_VECTOR_STORE_NAME, PUBLIC_AGENT_NAME
 from kb_tool import KB_DIR, KB_PATTERNS, KB_SYNC_FILE, KnowledgeBaseTool
 
 
@@ -47,18 +49,19 @@ def main() -> int:
     oai = project.get_openai_client()
     print(f"Foundry project: {endpoint}\n")
 
-    # --- Agent versions: keep the latest one (the app reuses it while its definition is unchanged)
-    try:
-        versions = sorted((v.as_dict() for v in project.agents.list_versions(agent_name=FOUNDRY_AGENT_NAME)),
-                          key=lambda v: v.get("created_at") or 0)
-    except ResourceNotFoundError:
-        versions = []
-    latest = versions[-1] if versions else None
-    old_versions = versions if args.all else versions[:-1]
-    print(f'Agent "{FOUNDRY_AGENT_NAME}": {len(versions)} version(s)')
-    for v in versions:
-        verdict = "remove" if v in old_versions else "keep (latest)"
-        print(f"  v{v['version']:<4} {when(v.get('created_at'))}   {verdict}")
+    # --- Agent versions: keep each agent's latest one (the app reuses it while its definition is unchanged)
+    agents: dict[str, tuple[list, list]] = {}  # name -> (all versions, versions to remove)
+    for name in (FOUNDRY_AGENT_NAME, PUBLIC_AGENT_NAME):
+        try:
+            versions = sorted((v.as_dict() for v in project.agents.list_versions(agent_name=name)),
+                              key=lambda v: v.get("created_at") or 0)
+        except ResourceNotFoundError:
+            versions = []
+        agents[name] = (versions, versions if args.all else versions[:-1])
+        print(f'Agent "{name}": {len(versions)} version(s)')
+        for v in versions:
+            verdict = "remove" if v in agents[name][1] else "keep (latest)"
+            print(f"  v{v['version']:<4} {when(v.get('created_at'))}   {verdict}")
 
     # --- Vector stores: keep the ones the app uses
     state = KnowledgeBaseTool._load_sync_state()
@@ -68,8 +71,9 @@ def main() -> int:
             keep_stores.add(state["vector_store_id"])
         if os.getenv("AZURE_VECTOR_STORE_ID", "").strip():
             keep_stores.add(os.getenv("AZURE_VECTOR_STORE_ID", "").strip())
-        for tool in (latest or {}).get("definition", {}).get("tools", []):
-            keep_stores.update(tool.get("vector_store_ids", []))
+        for versions, _ in agents.values():
+            for tool in (versions[-1] if versions else {}).get("definition", {}).get("tools", []):
+                keep_stores.update(tool.get("vector_store_ids", []))
     stores = [s for s in oai.vector_stores.list(limit=100) if s.name == KB_VECTOR_STORE_NAME]
     old_stores = [s for s in stores if s.id not in keep_stores]
     print(f'\nVector stores named "{KB_VECTOR_STORE_NAME}": {len(stores)}')
@@ -96,8 +100,9 @@ def main() -> int:
         f = all_files.get(fid)
         print(f"  {fid}  {getattr(f, 'filename', '?'):<42} {when(getattr(f, 'created_at', None))}   remove")
 
-    total = len(old_versions) + len(old_stores) + len(old_files)
-    summary = f"{len(old_versions)} agent version(s), {len(old_stores)} vector store(s), {len(old_files)} file(s)"
+    old_version_count = sum(len(old) for _, old in agents.values())
+    total = old_version_count + len(old_stores) + len(old_files)
+    summary = f"{old_version_count} agent version(s), {len(old_stores)} vector store(s), {len(old_files)} file(s)"
     if not total:
         print("\nNothing to remove.")
         return 0
@@ -108,12 +113,13 @@ def main() -> int:
     print(f"\nRemoving {summary}…")
     failures = 0
     steps = []
-    if args.all and versions:
-        steps.append((f"agent {FOUNDRY_AGENT_NAME}", lambda: project.agents.delete(agent_name=FOUNDRY_AGENT_NAME)))
-    else:
-        steps += [(f"agent version v{v['version']}",
-                   lambda v=v: project.agents.delete_version(agent_name=FOUNDRY_AGENT_NAME, agent_version=v["version"]))
-                  for v in old_versions]
+    for name, (versions, old_versions) in agents.items():
+        if args.all and versions:
+            steps.append((f"agent {name}", lambda name=name: project.agents.delete(agent_name=name)))
+        else:
+            steps += [(f"{name} v{v['version']}",
+                       lambda name=name, v=v: project.agents.delete_version(agent_name=name, agent_version=v["version"]))
+                      for v in old_versions]
     steps += [(f"vector store {s.id}", lambda s=s: oai.vector_stores.delete(s.id)) for s in old_stores]
     steps += [(f"file {fid}", lambda fid=fid: oai.files.delete(fid)) for fid in sorted(old_files)]
     for label, step in steps:

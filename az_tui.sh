@@ -1112,7 +1112,7 @@ menu_demo() {
     echo "  6) Run the test suite (test_demo_flows.py)"
     echo "  7) Launch the Streamlit UI (Ctrl+C to stop)"
     echo "  8) Run the Knowledge Base eval (kb_eval.py)"
-    echo "  9) Clean up Foundry objects (old agent versions, vector stores, files)"
+    echo "  9) Clean up Foundry objects (old versions of both agents, vector stores, files)"
     echo " 10) Read MANUAL_UI_SETUP_RUNBOOK.md"
     echo "  0) ← Back"
     echo
@@ -1147,12 +1147,12 @@ foundry_cleanup() {
   run_in_project "$PY" foundry_cleanup.py || return 1
   echo
   echo "  1) Remove the items marked 'remove'"
-  echo "  2) Remove everything the demo created (agent, vector store in use, files)"
+  echo "  2) Remove everything the demo created (both agents, vector store in use, files; the public chat page stops)"
   echo "  0) Cancel"
   local c; read -rp "  Choice [0]: " c || return 1
   case ${c:-0} in
     1) run_in_project "$PY" foundry_cleanup.py --yes ;;
-    2) confirm_name "the demo agent, its vector store and files" delete-all || return 1
+    2) confirm_name "both demo agents, their vector store and files" delete-all || return 1
        run_in_project "$PY" foundry_cleanup.py --all --yes ;;
     *) return 0 ;;
   esac
@@ -1239,7 +1239,7 @@ menu_feedback() {
     echo "  3) List problem reports"
     echo "  4) Show one entry in full"
     echo "  5) Delete an entry"
-    echo "  6) Deploy or update the Azure Function (MCP tools, deploy_mcp_tools.sh)"
+    echo "  6) Deploy or update the Azure Function (MCP tools + public chat page, deploy_mcp_tools.sh)"
     echo "  0) ← Back"
     [[ -n $FB_ACCOUNT ]] || echo -e "  ${DIM}No feedback table in .env yet, so this shows the app's local file; option 6 sets up the table.${RESET}"
     echo
@@ -1331,8 +1331,9 @@ fb_delete() {
 
 fb_deploy() {
   need_login || return
-  info "Creates or updates the function, its table and the Foundry connection, then writes FEEDBACK_* to .env."
-  info "Safe to re-run. The next app start (or eval) creates an agent version that uses it, if needed."
+  info "Creates or updates the Function App (MCP tools and the public chat page), its storage and the Foundry"
+  info "connections, writes MCP_SERVER_URL and the storage settings to .env, and creates or reuses both agents."
+  info "Safe to re-run. It prints the public chat page's address at the end."
   confirm "Run deploy_mcp_tools.sh?" || return
   run_in_project bash deploy_mcp_tools.sh
 }
