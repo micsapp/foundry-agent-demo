@@ -12,3 +12,6 @@ __pycache__/
 .kb_backups/
 demo_oracle_mock.db
 feedback_log.jsonl
+
+# Exported Foundry agent version definitions (hold the Function App address and vector store IDs)
+agent_versions/
