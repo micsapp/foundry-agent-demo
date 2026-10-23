@@ -2,7 +2,8 @@
 # az_tui.sh - Azure & Microsoft Foundry Manager TUI for foundry-agent-demo
 # Sign-in, resource groups, resource browsing, Foundry resources / projects /
 # model deployments, access checks, this demo's .env, tests and Streamlit UI, its feedback log,
-# and the subscription's cost, free credit, invoices and budgets.
+# its Azure Function (MCP tools and the public chat page) and the subscription's cost, free credit,
+# invoices and budgets.
 #
 # Options: AZ_BIN=/path/to/az  PYTHON=/path/to/python
 set -uo pipefail
@@ -111,6 +112,7 @@ ENV_FILE="$PROJECT_DIR/.env"
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/az_tui"
 STATE_FILE="$STATE_DIR/state"
 AZ="${AZ_BIN:-az}"
+ARM="https://management.azure.com"
 PY="${PYTHON:-python3}"
 [[ -z ${PYTHON:-} && -x "$PROJECT_DIR/.venv/bin/python" ]] && PY="$PROJECT_DIR/.venv/bin/python"  # project venv wins
 AZ_VENV="$HOME/.local/share/az-cli-venv"
@@ -180,14 +182,14 @@ az_works() { # cached once it succeeds; rechecked after a failure so a fresh ins
 }
 az_version() { "$AZ" version --query '"azure-cli"' -o tsv 2>/dev/null; }
 
-ACCT_USER="" ACCT_TYPE="" ACCT_SUB_NAME="" ACCT_SUB_ID="" ACCT_STATE=""
+ACCT_USER="" ACCT_TYPE="" ACCT_SUB_NAME="" ACCT_SUB_ID="" ACCT_TENANT="" ACCT_STATE=""
 refresh_account_info() {
-  ACCT_USER="" ACCT_TYPE="" ACCT_SUB_NAME="" ACCT_SUB_ID=""
+  ACCT_USER="" ACCT_TYPE="" ACCT_SUB_NAME="" ACCT_SUB_ID="" ACCT_TENANT=""
   if ! az_works; then ACCT_STATE="Azure CLI not working ($AZ) — use menu 9"; return 1; fi
   local j
   j=$("$AZ" account show -o json 2>/dev/null) || { ACCT_STATE="not signed in — use menu 2"; return 1; }
   ACCT_USER=$(jq -r '.user.name' <<<"$j"); ACCT_TYPE=$(jq -r '.user.type' <<<"$j")
-  ACCT_SUB_NAME=$(jq -r '.name' <<<"$j"); ACCT_SUB_ID=$(jq -r '.id' <<<"$j")
+  ACCT_SUB_NAME=$(jq -r '.name' <<<"$j"); ACCT_SUB_ID=$(jq -r '.id' <<<"$j"); ACCT_TENANT=$(jq -r '.tenantId' <<<"$j")
   # Selections belong to one subscription
   if [[ $ACCT_SUB_ID != "$SEL_SUB" ]]; then clear_selection; SEL_SUB=$ACCT_SUB_ID; save_state; fi
 }
@@ -204,6 +206,17 @@ azj() { # azj ARGS... — prints az JSON output; on failure prints the error and
   fi
   rm -f "$errf"
   return "$rc"
+}
+
+TENANT_DOMAIN="" TENANT_DOMAIN_OF="" PORTAL_URL=""
+portal_url() { # portal_url RESOURCE_ID [PAGE] — sets PORTAL_URL to a portal link that opens in the signed-in directory
+  # Names the directory by its domain (Resource Manager reports it, so no Graph sign-in is needed); a link without
+  # one opens in whichever account the browser picks, which fails with "does not exist in tenant" for another account
+  if [[ $TENANT_DOMAIN_OF != "$ACCT_TENANT" ]]; then
+    TENANT_DOMAIN=$("$AZ" rest --method get --url "$ARM/tenants?api-version=2022-12-01" \
+      --query "value[?tenantId=='$ACCT_TENANT'].defaultDomain | [0]" -o tsv 2>/dev/null) && TENANT_DOMAIN_OF=$ACCT_TENANT
+  fi
+  PORTAL_URL="https://portal.azure.com/#@${TENANT_DOMAIN:-$ACCT_TENANT}/resource$1${2:+/$2}"
 }
 
 need_az() {
@@ -651,8 +664,9 @@ res_details() {
   res_pick || return
   local id; id=$(jq -r .id <<<"$PICKED_RES")
   info "Fetching details…"
+  portal_url "$id"
   echo
-  echo -e "  Portal: ${CYAN}https://portal.azure.com/#@/resource${id}${RESET}"
+  echo -e "  Portal: ${CYAN}${PORTAL_URL}${RESET}"
   echo
   azj resource show --ids "$id" | jq -C .
 }
@@ -767,9 +781,10 @@ foundry_overview() {
   need_foundry || return
   info "Fetching $SEL_FOUNDRY…"
   local acct; acct=$(foundry_json) || return
+  portal_url "$(jq -r .id <<<"$acct")"
   echo
   jq -r '"  Foundry resource:  \(.name)\n  Resource group:    \(.resourceGroup)\n  Region:            \(.location)\n  SKU:               \(.sku.name)\n  State:             \(.properties.provisioningState)\n  Projects enabled:  \(.properties.allowProjectManagement // false)"' <<<"$acct"
-  echo -e "  Portal:            ${CYAN}https://portal.azure.com/#@/resource$(jq -r .id <<<"$acct")${RESET}"
+  echo -e "  Portal:            ${CYAN}${PORTAL_URL}${RESET}"
   echo -e "  Foundry portal:    ${CYAN}https://ai.azure.com${RESET}"
   if [[ -n $SEL_PROJECT ]]; then echo -e "  Project endpoint:  ${GREEN}$(project_endpoint)${RESET}"; fi
   echo; echo -e "  ${BOLD}Endpoints${RESET}"
@@ -1225,7 +1240,7 @@ run_streamlit() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  10) FEEDBACK LOG
+#  10) FEEDBACK LOG & AZURE FUNCTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 menu_feedback() {
@@ -1239,9 +1254,15 @@ menu_feedback() {
     echo "  3) List problem reports"
     echo "  4) Show one entry in full"
     echo "  5) Delete an entry"
-    echo "  6) Deploy or update the Azure Function (MCP tools + public chat page, deploy_mcp_tools.sh)"
-    echo "  0) ← Back"
     [[ -n $FB_ACCOUNT ]] || echo -e "  ${DIM}No feedback table in .env yet, so this shows the app's local file; option 6 sets up the table.${RESET}"
+    echo
+    echo -e "  ${BOLD}Azure Function${RESET}  ${DIM}($(fa_where))${RESET}"
+    echo "  ─────────────────────────────────"
+    echo "  6) Deploy or update the Azure Function (MCP tools + public chat page, deploy_mcp_tools.sh)"
+    echo "  7) Status: functions, public chat page check, portal links"
+    echo "  8) Public chat page: limits and use (today, last 7 days)"
+    echo "  9) Change a public chat limit"
+    echo "  0) ← Back"
     echo
     local c; read -rp "  Choice: " c || return
     case "$c" in
@@ -1251,6 +1272,9 @@ menu_feedback() {
       4) fb_show ;;
       5) fb_delete ;;
       6) fb_deploy ;;
+      7) fa_status ;;
+      8) fa_chat ;;
+      9) fa_set_limit ;;
       0) return ;;
       *) warn "Invalid choice" ;;
     esac
@@ -1338,6 +1362,132 @@ fb_deploy() {
   run_in_project bash deploy_mcp_tools.sh
 }
 
+# ── the Azure Function: MCP tools and the public chat page ────────────────────
+fa_host() { # prints the Function App's host name from MCP_SERVER_URL in .env (written by deploy_mcp_tools.sh)
+  [[ $(env_get MCP_SERVER_URL) =~ ^https://([^/]+) ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+fa_where() { local h; h=$(fa_host); printf '%s' "${h:-not deployed yet; option 6 creates it}"; }
+
+FA_JSON=""
+fa_load() { # sets FA_JSON to the Function App that serves MCP_SERVER_URL
+  local host apps; host=$(fa_host)
+  [[ -n $host ]] || { warn "No MCP_SERVER_URL in .env yet. Option 6 deploys the Function App and writes it."; return 1; }
+  need_login || return 1
+  info "Fetching the Function App…"
+  apps=$(azj functionapp list) || return 1
+  # Newer az versions nest the site's fields under .properties
+  FA_JSON=$(jq --arg h "$host" 'map(. + (.properties // {})) | map(select(.defaultHostName == $h)) | .[0] // empty' <<<"$apps")
+  [[ -n $FA_JSON ]] || { warn "No Function App at $host in subscription $ACCT_SUB_NAME. Switch subscription (menu 2) or re-run option 6."; return 1; }
+}
+
+fa_status() {
+  fa_load || return
+  local name rg host build code secs fns insights
+  name=$(jq -r .name <<<"$FA_JSON"); rg=$(jq -r .resourceGroup <<<"$FA_JSON"); host=$(jq -r .defaultHostName <<<"$FA_JSON")
+  info "Checking the chat page and listing the functions (the first request after a quiet spell starts an instance)…"
+  build=$(curl -s --max-time 30 "https://$host/api/health" | jq -r '.build // empty' 2>/dev/null)
+  read -r code secs < <(curl -s -o /dev/null -w '%{http_code} %{time_total}\n' --max-time 30 "https://$host/api/chat")
+  fns=$(azj functionapp function list -g "$rg" -n "$name") || return
+  echo
+  jq -r '"  Function App:    \(.name)  (\(.state // "-"))",
+         "  Group, region:   \(.resourceGroup), \(.location)",
+         "  Plan:            \(.functionAppConfig as $f | if $f then "Flex Consumption, \($f.runtime.name) \($f.runtime.version), \($f.scaleAndConcurrency | .instanceMemoryMB // .instanceMemoryMb) MB, up to \($f.scaleAndConcurrency.maximumInstanceCount) instances" else .kind end)",
+         "  Last changed:    \(.lastModifiedTimeUtc // "-" | .[0:16] | sub("T"; " ")) UTC"' <<<"$FA_JSON"
+  echo -e "  Live build:      ${build:-${RED}no answer from /api/health${RESET}}"
+  if [[ $code == 200 ]]; then
+    echo -e "  Public chat:     ${GREEN}✓ up${RESET} (HTTP 200 in $(printf '%.1f' "$secs")s)  ${CYAN}https://$host/api/chat${RESET}"
+  else
+    echo -e "  Public chat:     ${RED}✗ $([[ $code == 000 ]] && echo 'no answer' || echo "HTTP $code")${RESET}  https://$host/api/chat"
+  fi
+  echo -e "  MCP endpoint:    https://$host/runtime/webhooks/mcp  ${DIM}(Foundry sends the key from its connections)${RESET}"
+  portal_url "$(jq -r .id <<<"$FA_JSON")" appServices
+  echo -e "  Portal:          ${CYAN}${PORTAL_URL}${RESET}"
+  echo -e "  ${DIM}                 There: Settings → Environment variables (chat limits), Monitoring → Log stream (live logs)${RESET}"
+  insights=$(jq -r '.tags["hidden-link: /app-insights-resource-id"] // empty' <<<"$FA_JSON")
+  if [[ -n $insights ]]; then
+    portal_url "$insights"
+    echo -e "  App Insights:    ${CYAN}${PORTAL_URL}${RESET}  ${DIM}(failures, requests, logs)${RESET}"
+  fi
+  echo; echo -e "  ${BOLD}Functions${RESET}"
+  { printf 'Function\tTrigger\tAddress\tAccess\tEnabled\n'
+    jq -r 'map(.config.bindings[0] as $b | {name: (.name | split("/")[-1]), b: $b, off: .isDisabled}) | sort_by(.b.type, .name) | .[]
+      | "\(.name)\t\(if .b.type == "mcpToolTrigger" then "MCP tool" elif .b.type == "httpTrigger" then "HTTP \(.b.methods // [] | join(","))" else .b.type end)\t\(if .b.type == "mcpToolTrigger" then "/runtime/webhooks/mcp" elif .b.type == "httpTrigger" then "/api/\(.b.route // .name)" else "-" end)\t\(if .b.type == "mcpToolTrigger" then "MCP key" else (.b.authLevel // "function" | ascii_downcase) end)\t\(if .off then "no" else "yes" end)"' <<<"$fns"
+  } | table
+}
+
+# The chat page's limits: app setting, what it limits, and the default azure_function/public_chat.py uses when unset
+CHAT_LIMITS='[["CHAT_PER_VISITOR_PER_HOUR", "Requests per visitor per hour", 20],
+              ["CHAT_DAILY_LIMIT", "Replies per UTC day, all visitors", 100],
+              ["CHAT_MAX_MESSAGE_CHARS", "Longest message (characters)", 1000]]'
+LIMIT_HDR=$'Limit\tSetting\tValue'
+LIMIT_ROW='"\(.label)\t\(.setting)\t\(.shown)"'
+FA_SETTINGS=""
+fa_settings() { # sets FA_SETTINGS to {name: value} for the chat settings only (not the visitor salt or secrets)
+  FA_SETTINGS=$(azj functionapp config appsettings list -g "$(jq -r .resourceGroup <<<"$FA_JSON")" -n "$(jq -r .name <<<"$FA_JSON")" \
+    --query "[?contains(['PUBLIC_CHAT_AGENT', 'FEEDBACK_TABLE_ENDPOINT', $(jq -r 'map("'"'"'\(.[0])'"'"'") | join(", ")' <<<"$CHAT_LIMITS")], name)]") \
+    || return 1
+  FA_SETTINGS=$(jq 'map({(.name): .value}) | add // {}' <<<"$FA_SETTINGS")
+}
+fa_limits() { # prints the limits as [{setting, label, value (what the function uses), shown}]
+  jq -c --argjson s "$FA_SETTINGS" 'map({setting: .[0], label: .[1], default: .[2], raw: $s[.[0]]}
+    | .valid = (.raw != null and (.raw | test("^\\s*[-+]?[0-9]+\\s*$")))
+    | .value = (if .valid then (.raw | gsub("[\\s+]"; "") | tonumber) else .default end)
+    | .shown = (if .raw == null then "\(.default) (default)" elif .valid then "\(.value)" else "\(.raw) (not a number, so \(.default))" end))' \
+    <<<"$CHAT_LIMITS"
+}
+
+fa_chat() {
+  fa_load && fa_settings || return
+  local limits host acct day hour week json
+  limits=$(fa_limits); host=$(jq -r .defaultHostName <<<"$FA_JSON")
+  echo
+  echo -e "  Public chat page:  ${CYAN}https://$host/api/chat${RESET}"
+  echo -e "  Agent:             $(jq -r '.PUBLIC_CHAT_AGENT // "(PUBLIC_CHAT_AGENT not set, so the page answers 503)"' <<<"$FA_SETTINGS")"
+  echo; echo -e "  ${BOLD}Limits${RESET}  ${DIM}(Function App settings; option 9 changes them)${RESET}"
+  { printf '%s\n' "$LIMIT_HDR"; jq -r ".[] | $LIMIT_ROW" <<<"$limits"; } | table
+
+  [[ $(jq -r '.FEEDBACK_TABLE_ENDPOINT // ""' <<<"$FA_SETTINGS") =~ ^https://([a-z0-9]+)\.table\. ]] \
+    || { warn "The Function App has no FEEDBACK_TABLE_ENDPOINT, so there are no counters to read; re-run option 6."; return; }
+  acct=${BASH_REMATCH[1]}
+  day=$(date -u +%Y%m%d); hour=$(date -u +%Y%m%d%H); week=$(date -u -d '6 days ago' +%Y%m%d)
+  info "Reading the counters…"
+  # Partitions as public_chat.py writes them: day-YYYYMMDD/all (replies that day) and visitor-YYYYMMDDHH/<visitor hash>
+  json=$(azj storage entity query --account-name "$acct" --table-name publicchat --auth-mode login --select PartitionKey RowKey count \
+    --filter "(PartitionKey ge 'day-$week' and PartitionKey le 'day-$day') or (PartitionKey ge 'visitor-${day}00' and PartitionKey le 'visitor-${day}23')") \
+    || { warn "Reading the counters needs a recent sign-in (menu 2) and the Storage Table Data role (option 6 grants it)."; return; }
+  echo; echo -e "  ${BOLD}Use${RESET}  ${DIM}(UTC; table publicchat in $acct)${RESET}"
+  jq -r --arg d "day-$day" --arg h "visitor-$hour" --argjson limits "$limits" '
+    ($limits | map({(.setting): .value}) | add) as $l
+    | [.items[] | select(.PartitionKey == $d) | .count] as $today
+    | [.items[] | select(.PartitionKey == $h)] as $now
+    | [.items[] | select(.PartitionKey | startswith("visitor-"))] as $visits
+    | "  Replies today:       \($today | add // 0) of \($l.CHAT_DAILY_LIMIT)",
+      "  Visitors this hour:  \($now | length)\(if ($now | length) > 0 then "  (busiest: \($now | map(.count) | max) of \($l.CHAT_PER_VISITOR_PER_HOUR) requests)" else "" end)",
+      "  Visitors today:      \($visits | map(.RowKey) | unique | length)  (\($visits | map(.count) | add // 0) requests in all)"' <<<"$json"
+  echo; echo -e "  ${BOLD}Replies per day, last 7 days${RESET}  ${DIM}(days with no replies are left out)${RESET}"
+  { printf 'Date (UTC)\tReplies\t\n'
+    jq -r '[.items[] | select(.PartitionKey | startswith("day-"))] | (map(.count) | max // 0) as $max | sort_by(.PartitionKey) | .[]
+      | "\(.PartitionKey[4:8])-\(.PartitionKey[8:10])-\(.PartitionKey[10:12])\t\(.count)\t\(if $max > 0 then "▇" * ([(.count / $max * 30 | ceil), 1] | max) else "" end)"' <<<"$json"
+  } | table
+}
+
+fa_set_limit() {
+  fa_load && fa_settings || return
+  local limits setting cur new
+  limits=$(fa_limits)
+  pick "Change which public chat limit?" "$limits" "$LIMIT_HDR" "$LIMIT_ROW" || return
+  setting=$(jq -r ".[$PICKED].setting" <<<"$limits"); cur=$(jq -r ".[$PICKED].value" <<<"$limits")
+  ask new "New value for $setting (a whole number, 1 or more)" "$cur" || return
+  [[ $new =~ ^[1-9][0-9]*$ ]] || { warn "Use a whole number of 1 or more."; return; }
+  if [[ $setting == CHAT_DAILY_LIMIT ]]; then # measured: about half a cent per reply on gpt-5-mini
+    info "At roughly \$0.005 a reply, $new replies a day is up to about \$$(awk -v n="$new" 'BEGIN { printf "%.2f", n * 0.005 }') a day."
+  fi
+  confirm "Set $setting to $new? The Function App restarts, which can cut off a reply in progress" || return
+  run "$AZ" functionapp config appsettings set -g "$(jq -r .resourceGroup <<<"$FA_JSON")" -n "$(jq -r .name <<<"$FA_JSON")" \
+    --settings "$setting=$new" --only-show-errors -o none \
+    && info "deploy_mcp_tools.sh doesn't set the limits, so re-running it keeps this value."
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  11) COST & CREDITS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1376,7 +1526,6 @@ menu_cost() {
   done
 }
 
-ARM="https://management.azure.com"
 # Money for tables: 2 decimals; amounts under half a cent show as <0.01 rather than 0.00
 JQ_MONEY='def money: if . == 0 then "0.00" elif . < 0.005 then "<0.01" else ((. * 100 | round) as $c | "\($c / 100 | floor).\($c % 100 | tostring | if length == 1 then "0" + . else . end)") end;'
 
@@ -1620,7 +1769,7 @@ main_menu() {
   echo "  7) Access & Smoke Test"
   echo "  8) Demo Project (.env, SDK, tests, Streamlit)"
   echo "  9) Azure CLI Install / Repair"
-  echo " 10) Feedback Log (unanswered questions, problem reports)"
+  echo " 10) Feedback Log & Azure Function (MCP tools, public chat page)"
   echo " 11) Cost & Credits (spend, free credit, invoices, budgets)"
   echo "  0) Exit"
   echo
