@@ -4,3 +4,4 @@ azure-identity>=1.19.0
 azure-storage-blob>=12.19.0
 azure-ai-projects>=2.0.0
 openai>=1.55.0
+jsonschema>=4.23.0

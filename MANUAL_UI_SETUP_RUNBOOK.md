@@ -149,3 +149,14 @@ Neither option below needs this machine or the Streamlit app running.
 3. Visitors spend your subscription's credit. Each visitor gets 20 messages an hour and everyone together 100 replies a day. `./az_tui.sh` → 10 → 8 shows the limits and how much of them is used; → 9 changes one. In the Azure portal they're under the Function App → **Settings → Environment variables** (`CHAT_PER_VISITOR_PER_HOUR`, `CHAT_DAILY_LIMIT`, `CHAT_MAX_MESSAGE_CHARS`).
    * To find the Function App in the portal, sign in at [portal.azure.com](https://portal.azure.com) with the account that owns the subscription; another account sees nothing, or gets "account does not exist in tenant". `./az_tui.sh` → 10 → 7 prints a direct link that opens in the right directory.
 4. Questions the page couldn't answer show up in the Streamlit app's **Feedback Log** tab like any other entry.
+
+## Part 4: Demonstrate Skills and Script Execution
+
+1. Run `./deploy_mcp_tools.sh` to package the skills with the existing Azure Function and update both agents. The function serves all skill tools, the report script and the public page; no VM or running Streamlit app is needed.
+2. In the Foundry playground or public chat page, ask **List available skills**. It should list `incident-report`.
+3. Ask **Generate an incident report for INC-1042 using the incident-report skill**. The agent loads the skill and reference, then calls `run_skill_script`. The Python script runs on the Azure Function and returns the current incident, owner, severity and status.
+4. Ask **Generate an incident report for all incidents** to see totals by severity and status. Generating reports changes no database records or KB files.
+5. In the playground's tool trace, inspect `list_skills`, `load_skill`, `read_skill_resource` and `run_skill_script`. If you inspect the tools manually, the `skills-mcp` connection must allow all four names. The deploy script configures this and stores the Function key in the connection.
+6. Streamlit also has a **Generate incident report (skill)** button. In local demo mode, the same script runs locally for offline testing. In Foundry mode with the deployed MCP server, it runs on Azure Functions.
+
+Skills live in `skills/`; their approved resources, scripts and argument schemas are registered in `skill_tool.py`. Redeploy the function after changing them. See README section 8 for the input/output contract and adding skills.

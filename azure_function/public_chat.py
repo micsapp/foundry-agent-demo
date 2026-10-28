@@ -9,7 +9,7 @@ to this subscription. Limits, each an app setting:
 - CHAT_MAX_MESSAGE_CHARS (default 1000): longest message accepted.
 The counters live in the Azure Table "publicchat" next to the feedback table.
 
-The agent's tools (File Search, query_oracle_db, log_feedback) need no approval; if Foundry asks for one anyway,
+The agent's tools (File Search, query_oracle_db, log_feedback and packaged read-only skills) need no approval; if Foundry asks for one anyway,
 it's refused. Conversations made here carry the metadata source=public-chat and only those are continued, so a
 visitor can't reach any other conversation in the project.
 """
@@ -28,7 +28,11 @@ CONVERSATION_SOURCE = {"source": "public-chat"}
 CONVERSATION_ID = re.compile(r"^conv_[A-Za-z0-9]{8,128}$")
 LIMITS_TABLE = "publicchat"
 MAX_APPROVAL_ROUNDS = 3  # an approval request shouldn't happen at all; stop refusing after this many
-TOOL_LABELS = {"query_oracle_db": "database", "log_feedback": "feedback"}  # file_search_call -> knowledge_base
+TOOL_LABELS = {
+    "query_oracle_db": "database", "log_feedback": "feedback",
+    "list_skills": "skills", "load_skill": "skills", "read_skill_resource": "skills",
+    "run_skill_script": "incident report",
+}  # file_search_call -> knowledge_base
 
 
 def _setting(name: str, default: int) -> int:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploys the Azure Function that serves the agent's log_feedback, query_oracle_db, update_oracle_incident and
-# propose_kb_file_update tools as an MCP server, which Foundry calls itself (so they also work in the Foundry
+# propose_kb_file_update and packaged skill tools as an MCP server, which Foundry calls itself (so they also work in the Foundry
 # portal playground), and a public chat page (no sign-in) for a read-only agent. Safe to re-run: existing
 # resources are reused and the code is redeployed.
 #
@@ -13,15 +13,15 @@
 #      Data Contributor on both containers; for the Function App also Foundry User on the Foundry resource, so it
 #      can re-index updated KB files in the vector store
 #   4. Code from azure_function/ (including the chat page in public/) plus feedback_log.py, oracle_tool.py,
-#      kb_tool.py and guardrails.py, built remotely
+#      kb_tool.py, guardrails.py, skill_tool.py and skills/, built remotely
 #   5. Waits until the new build answers on /api/health
 #   6. The app's mcp_extension system key, stored only in the Foundry MCP ("remote tool") connections
-#      feedback-log-mcp, oracle-db-mcp and knowledge-base-mcp (one per tool group, so the portal tells them apart)
-#   7. MCP smoke test (lists the tools, runs one read-only query), then MCP_SERVER_URL, FEEDBACK_TABLE_ENDPOINT,
+#      feedback-log-mcp, oracle-db-mcp, knowledge-base-mcp and skills-mcp (one per tool group)
+#   7. MCP smoke test (lists tools, runs a read-only query and an incident-report skill), then MCP_SERVER_URL, FEEDBACK_TABLE_ENDPOINT,
 #      FEEDBACK_TABLE_NAME, DB_MODE=azure_blob, ORACLE_MOCK_BLOB_URL, KB_MODE=azure_blob and KB_BLOB_CONTAINER_URL
 #      in .env
 #   8. Creates or reuses the agent versions, as an app start does: the main agent and the public chat page's
-#      read-only agent (File Search, query_oracle_db and log_feedback only). Then checks the page at /api/chat
+#      read-only agent (File Search, query_oracle_db, log_feedback and packaged skills). Then checks /api/chat
 #   9. Removes what earlier versions of this script deployed: the Function App feedback-log-<suffix> (with its
 #      role assignments, Application Insights, plan and package container) and the connection feedback-mcp
 #
@@ -96,7 +96,7 @@ DB_BLOB_URL="https://$STORAGE.blob.core.windows.net/$DB_CONTAINER/demo_oracle_mo
 KB_CONTAINER=knowledge-base
 KB_CONTAINER_URL="https://$STORAGE.blob.core.windows.net/$KB_CONTAINER"
 FOUNDRY_USER_ROLE=53ca6127-db72-4b80-b1b0-d745d6d5456d # Foundry User (formerly Azure AI User); IDs survive renames
-CONNECTIONS_FOR_TOOLS=(feedback-log-mcp oracle-db-mcp knowledge-base-mcp) # names agent_service.py expects
+CONNECTIONS_FOR_TOOLS=(feedback-log-mcp oracle-db-mcp knowledge-base-mcp skills-mcp) # names agent_service.py expects
 OLD_CONNECTIONS=(feedback-mcp feedback-function) # from earlier versions (MCP, then OpenAPI)
 DEPLOY_CONTAINER=function-deploy
 echo "Foundry: $ACCOUNT / $PROJECT   resource group: $RG   region: $LOCATION"
@@ -167,7 +167,12 @@ BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 mkdir "$BUILD/src"
 cp -r azure_function/function_app.py azure_function/public_chat.py azure_function/public azure_function/host.json \
-  azure_function/requirements.txt feedback_log.py oracle_tool.py kb_tool.py guardrails.py "$BUILD/src/"
+  azure_function/requirements.txt feedback_log.py oracle_tool.py kb_tool.py guardrails.py skill_tool.py "$BUILD/src/"
+"$PY" - "$BUILD/src" <<'EOF'
+import shutil, sys
+from pathlib import Path
+shutil.copytree("skills", Path(sys.argv[1]) / "skills", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+EOF
 BUILD_ID=$(cd "$BUILD/src" && find . -type f | sort | xargs cat | sha256sum | cut -c1-12)
 echo "$BUILD_ID" > "$BUILD/src/build_id.txt"
 (cd "$BUILD/src" && zip -qr ../function.zip .)
@@ -247,10 +252,10 @@ mcp_post '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersi
 SESSION=$(tr -d '\r' < "$BUILD/mcp-headers" | awk -F': ' 'tolower($1) == "mcp-session-id" { print $2 }')
 mcp_post '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$SESSION" >/dev/null
 TOOLS=$(mcp_post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$SESSION")
-for tool in log_feedback query_oracle_db update_oracle_incident propose_kb_file_update; do
+for tool in log_feedback query_oracle_db update_oracle_incident propose_kb_file_update list_skills load_skill read_skill_resource run_skill_script; do
   grep -q "\"$tool\"" <<<"$TOOLS" || { echo "MCP tools/list didn't include $tool: $(head -c 400 <<<"$TOOLS")"; exit 1; }
 done
-echo "MCP server lists log_feedback, query_oracle_db, update_oracle_incident and propose_kb_file_update"
+echo "MCP server lists all 8 tools, including skill discovery, resources and script execution"
 QUERY='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_oracle_db","arguments":{"sql_query":"SELECT COUNT(*) AS INCIDENTS FROM SYSTEM_INCIDENTS","reason":"deploy check"}}}'
 for attempt in $(seq 1 12); do # a new role assignment can take a few minutes to reach the storage account
   RESULT=$(mcp_post "$QUERY" "$SESSION" | "$PY" -c '
@@ -267,6 +272,25 @@ except Exception:
 done
 [[ $RESULT == *" incidents" ]] || { echo "query_oracle_db failed: $RESULT"; exit 1; }
 echo "query_oracle_db works: $RESULT in the mock database"
+check_skill() { # check_skill JSON EXPECTED_FIELD: fails on MCP or application errors
+  mcp_post "$1" "$SESSION" | "$PY" -c '
+import json, sys
+body = sys.stdin.read()
+lines = [line[5:] for line in body.splitlines() if line.startswith("data:")] or [body]
+try:
+    result = json.loads(lines[-1])["result"]
+    out = json.loads(result["content"][0]["text"])
+    if result.get("isError") or not out.get("success") or sys.argv[1] not in out:
+        raise ValueError(str(out)[:300])
+except (KeyError, ValueError, IndexError) as exc:
+    sys.exit(f"Skill smoke test failed: {exc}")
+' "$2"
+}
+check_skill '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_skills","arguments":{}}}' skills
+check_skill '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"load_skill","arguments":{"skill_name":"incident-report"}}}' content
+check_skill '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"read_skill_resource","arguments":{"skill_name":"incident-report","resource_name":"references/report-format.md"}}}' content
+check_skill '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run_skill_script","arguments":{"skill_name":"incident-report","script_name":"generate_report","arguments_json":"{\"incident_id\":\"INC-1042\"}"}}}' result
+echo "incident-report skill loaded its reference and executed generate_report on the Azure Function"
 NOKEY=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$MCP_URL" -H 'Content-Type: application/json' -d '{}')
 echo "Without the key: HTTP $NOKEY (expected 401)"
 cp -p .env ".env.bak.$(date +%Y%m%d-%H%M%S)"

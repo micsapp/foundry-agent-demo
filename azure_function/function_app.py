@@ -7,6 +7,9 @@ Azure Function serving the agent's server-side tools over MCP (Model Context Pro
 - `propose_kb_file_update` edits a Knowledge Base Markdown file in the blob container KB_BLOB_CONTAINER_URL and
   re-indexes it in the vector store File Search uses (the one named in the container's sync record), with the
   same guardrails as the app. It reaches the vector store as the Function App's identity (Foundry User role).
+- `list_skills`, `load_skill`, `read_skill_resource` and `run_skill_script` expose packaged skills.
+  Registered Python scripts run here with validated arguments and a timeout; the incident-report
+  skill receives a masked, read-only database snapshot and returns Markdown and JSON.
 
 The agent definition makes Foundry ask a person to approve each `update_oracle_incident` and
 `propose_kb_file_update` call before it reaches this function, so neither asks again here.
@@ -19,8 +22,8 @@ playground, and MCP is a tool type gpt-5-mini supports.
 It also serves a public chat page, GET /api/chat, where anyone can talk to a read-only agent without signing in
 (public_chat.py has the limits and safeguards).
 
-Deployed by ../deploy_mcp_tools.sh, which copies feedback_log.py, oracle_tool.py, kb_tool.py and
-guardrails.py next to this file so masking, guardrails and the storage code match the Streamlit app exactly, and writes
+Deployed by ../deploy_mcp_tools.sh, which copies feedback_log.py, oracle_tool.py, kb_tool.py,
+guardrails.py, skill_tool.py and skills/ next to this file so the tools match the local demo, and writes
 build_id.txt so the script can tell when the new code is live (GET /api/health returns it).
 """
 
@@ -36,6 +39,7 @@ from guardrails import GuardrailEngine
 from kb_tool import KnowledgeBaseTool
 from oracle_tool import OracleDatabaseTool
 from public_chat import default_chat
+from skill_tool import SkillTool
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 _store = None
@@ -65,6 +69,49 @@ def _knowledge_base() -> KnowledgeBaseTool:
         kb.attach_vector_store(project.get_openai_client(), endpoint)
         _kb = kb
     return _kb
+
+
+_skills = SkillTool(database_factory=_database)
+
+
+@app.mcp_tool()
+def list_skills() -> str:
+    """Discover packaged agent skills before selecting one for an incident report or handover."""
+    return json.dumps(_skills.list_skills())
+
+
+@app.mcp_tool()
+@app.mcp_tool_property(arg_name="skill_name", description="Exact skill name returned by list_skills.")
+def load_skill(skill_name: str) -> str:
+    """Load a skill's instructions, script argument schemas and resource names before using it."""
+    return json.dumps(_skills.load_skill(skill_name))
+
+
+@app.mcp_tool()
+@app.mcp_tool_property(arg_name="skill_name", description="Exact skill name returned by list_skills.")
+@app.mcp_tool_property(arg_name="resource_name", description="Exact resource name returned by load_skill.")
+def read_skill_resource(skill_name: str, resource_name: str) -> str:
+    """Read a packaged reference resource using an exact name returned by load_skill."""
+    return json.dumps(_skills.read_skill_resource(skill_name, resource_name))
+
+
+@app.mcp_tool()
+@app.mcp_tool_property(arg_name="skill_name", description="Exact skill name returned by list_skills.")
+@app.mcp_tool_property(arg_name="script_name", description="Exact registered script name returned by load_skill.")
+@app.mcp_tool_property(
+    arg_name="arguments_json",
+    description="A JSON object encoded as a string matching the script's arguments_schema. Use '{}' for defaults.",
+    is_required=False,
+)
+def run_skill_script(skill_name: str, script_name: str, arguments_json: str = "{}") -> str:
+    """Run a named packaged read-only skill script on this Azure Function and return its JSON result.
+
+    Load the skill first. Only registered scripts run, with argument validation and
+    a timeout. Command lines, arbitrary code and user-supplied paths are unsupported.
+    """
+    result = _skills.run_skill_script(skill_name, script_name, arguments_json)
+    logging.info("Skill %s/%s: success=%s", skill_name, script_name, result["success"])
+    return json.dumps(result, ensure_ascii=False)
 
 
 @app.mcp_tool()

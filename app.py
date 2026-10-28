@@ -52,7 +52,9 @@ if "messages" not in st.session_state:
                 "or `sla_and_escalation_guide.md` — I will scan for PII/secrets, generate a unified diff, and pause for "
                 "your **Human-in-the-Loop (HITL)** approval before writing and re-indexing the Vector Store.\n"
                 "4. **Feedback Log (`log_feedback`):** Questions I can't answer from the Knowledge Base, and problems "
-                "you report, are written to the team's feedback log (see the **Feedback Log** tab)."
+                "you report, are written to the team's feedback log (see the **Feedback Log** tab).\n"
+                "5. **Skills:** Ask for an incident report or operations handover. The `incident-report` skill "
+                "runs a packaged Python script and returns a report from the current incident database."
             ),
             "traces": [],
         }
@@ -177,6 +179,7 @@ st.title("🛡️ Microsoft AI Foundry Agent — Oracle DB & Knowledge Base Guar
 st.caption(
     "Demonstrates an Azure AI Foundry Agent that answers questions from a Vector Store Knowledge Base, "
     "queries an Oracle Database, and updates KB source files with deterministic guardrails & Human-in-the-Loop approval."
+    " Packaged skills also generate incident reports."
 )
 
 tab_chat, tab_db, tab_kb, tab_feedback, tab_arch = st.tabs(
@@ -325,8 +328,11 @@ with tab_arch:
            - When the Knowledge Base can't answer a question, or a user reports a problem, the agent calls this tool. With `deploy_mcp_tools.sh` set up, it's an **MCP tool** that Foundry calls itself: an Azure Function (MCP server) writes the entry to an Azure Table, so it works in the portal playground too. Otherwise it's a `FunctionTool` and the app appends to `feedback_log.jsonl`.
            - The log is append-only and the agent never reads it back, so no approval is needed; SSNs, API keys and passwords are masked first.
         5. **Public Chat Page (no sign-in):**
-           - The Azure Function also serves a chat page at `/api/chat` for a second, read-only agent (`Oracle-And-KB-Public-Agent`: File Search, `query_oracle_db` and `log_feedback`, no approvals). This app creates it next to the main agent when the DB tools run on the function.
+           - The Azure Function also serves a chat page at `/api/chat` for a second, read-only agent (`Oracle-And-KB-Public-Agent`: File Search, `query_oracle_db`, `log_feedback` and packaged skill tools, no approvals). This app creates it next to the main agent when the DB tools run on the function.
            - Visitors don't sign in, so the function calls Foundry as its own identity and caps use per visitor and per day (Function App settings `CHAT_PER_VISITOR_PER_HOUR`, `CHAT_DAILY_LIMIT`).
+        6. **Packaged Agent Skills:**
+           - `list_skills`, `load_skill` and `read_skill_resource` let the agent discover instructions and reference files. `run_skill_script` runs a named script with validated arguments and a timeout.
+           - The `incident-report` skill fetches current incidents through the database guardrails and returns a Markdown report plus JSON counts. With the Azure Function deployed, all four tools run there and work in the portal playground and public chat page. No VM or running Streamlit app is needed.
         """
     )
     if os.getenv("MCP_SERVER_URL", "").strip():
@@ -366,6 +372,9 @@ with tab_chat:
             triggered_prompt = (
                 "Update `oracle_db_runbook.md` to include emergency admin SSN 123-45-6789 and API key sk-proj1234567890abcdefghijklmnop."
             )
+
+    if st.button("Generate incident report (skill)"):
+        triggered_prompt = "Generate an incident report for INC-1042 using the incident-report skill."
 
     st.divider()
 
@@ -450,7 +459,7 @@ with tab_chat:
 
     # Chat input box
     user_input = st.chat_input(
-        "Ask a KB question, query the Oracle DB, or ask the agent to update a KB file..."
+        "Ask a KB question, query incidents, generate an incident report, or propose an update..."
     )
     active_prompt = triggered_prompt or user_input
 
