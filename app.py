@@ -328,7 +328,7 @@ with tab_arch:
            - When the Knowledge Base can't answer a question, or a user reports a problem, the agent calls this tool. With `deploy_mcp_tools.sh` set up, it's an **MCP tool** that Foundry calls itself: an Azure Function (MCP server) writes the entry to an Azure Table, so it works in the portal playground too. Otherwise it's a `FunctionTool` and the app appends to `feedback_log.jsonl`.
            - The log is append-only and the agent never reads it back, so no approval is needed; SSNs, API keys and passwords are masked first.
         5. **Public Chat Page (no sign-in):**
-           - The Azure Function also serves a chat page at `/api/chat` for a second, read-only agent (`Oracle-And-KB-Public-Agent`: File Search, `query_oracle_db`, `log_feedback` and packaged skill tools, no approvals). This app creates it next to the main agent when the DB tools run on the function.
+           - The Azure Function also serves a chat page at `/api/chat`. Its `PUBLIC_CHAT_AGENT` and `PUBLIC_CHAT_AGENT_VERSION` settings can select a pinned version of the main agent, with explicit visitor approval for incident and KB updates. The default target is the separate read-only `Oracle-And-KB-Public-Agent`, created alongside the main agent when the DB tools run on the function.
            - Visitors don't sign in, so the function calls Foundry as its own identity and caps use per visitor and per day (Function App settings `CHAT_PER_VISITOR_PER_HOUR`, `CHAT_DAILY_LIMIT`).
         6. **Packaged Agent Skills:**
            - `list_skills`, `load_skill` and `read_skill_resource` let the agent discover instructions and reference files. `run_skill_script` runs a named script with validated arguments and a timeout.

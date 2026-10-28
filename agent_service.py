@@ -423,7 +423,7 @@ class FoundryAgentOrchestrator:
         self.openai_client: Optional[Any] = None
         self.foundry_agent_name: Optional[str] = None
         self.foundry_agent_version: Optional[str] = None
-        self.public_agent_status: str = "not created"  # the public chat page's read-only agent
+        self.public_agent_status: str = "not created"  # the separate read-only companion agent
         self.foundry_conversation_id: Optional[str] = None
         self.foundry_status: str = "Not connected — using local demo mode."
         # Approval decisions made since the last Foundry turn, sent to the agent with the next message
@@ -512,7 +512,7 @@ class FoundryAgentOrchestrator:
             self.foundry_status = (
                 f"Connected to {endpoint} — agent {agent_name} v{agent_version} ({agent_how}), {store_status}, "
                 f"feedback log: {feedback_where}, database tools: {db_where} ({self.oracle_tool.location}), "
-                f"KB updates: {kb_where} ({self.kb_tool.location}), public chat agent: {self.public_agent_status}."
+                f"KB updates: {kb_where} ({self.kb_tool.location}), read-only companion agent: {self.public_agent_status}."
             )
         except Exception as exc:
             # Fall back to demo mode if credentials, roles, or the endpoint aren't ready yet

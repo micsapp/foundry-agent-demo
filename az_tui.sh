@@ -1424,7 +1424,7 @@ LIMIT_ROW='"\(.label)\t\(.setting)\t\(.shown)"'
 FA_SETTINGS=""
 fa_settings() { # sets FA_SETTINGS to {name: value} for the chat settings only (not the visitor salt or secrets)
   FA_SETTINGS=$(azj functionapp config appsettings list -g "$(jq -r .resourceGroup <<<"$FA_JSON")" -n "$(jq -r .name <<<"$FA_JSON")" \
-    --query "[?contains(['PUBLIC_CHAT_AGENT', 'FEEDBACK_TABLE_ENDPOINT', $(jq -r 'map("'"'"'\(.[0])'"'"'") | join(", ")' <<<"$CHAT_LIMITS")], name)]") \
+    --query "[?contains(['PUBLIC_CHAT_AGENT', 'PUBLIC_CHAT_AGENT_VERSION', 'FEEDBACK_TABLE_ENDPOINT', $(jq -r 'map("'"'"'\(.[0])'"'"'") | join(", ")' <<<"$CHAT_LIMITS")], name)]") \
     || return 1
   FA_SETTINGS=$(jq 'map({(.name): .value}) | add // {}' <<<"$FA_SETTINGS")
 }
@@ -1443,6 +1443,7 @@ fa_chat() {
   echo
   echo -e "  Public chat page:  ${CYAN}https://$host/api/chat${RESET}"
   echo -e "  Agent:             $(jq -r '.PUBLIC_CHAT_AGENT // "(PUBLIC_CHAT_AGENT not set, so the page answers 503)"' <<<"$FA_SETTINGS")"
+  echo -e "  Version:           $(jq -r '.PUBLIC_CHAT_AGENT_VERSION | if . == null or . == "" then "latest" else . end' <<<"$FA_SETTINGS")"
   echo; echo -e "  ${BOLD}Limits${RESET}  ${DIM}(Function App settings; option 9 changes them)${RESET}"
   { printf '%s\n' "$LIMIT_HDR"; jq -r ".[] | $LIMIT_ROW" <<<"$limits"; } | table
 

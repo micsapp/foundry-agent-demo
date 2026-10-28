@@ -77,13 +77,20 @@
   textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   #send { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
   .fineprint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .approval { border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-top: 10px; }
+  .approval h3 { font-size: 15px; margin: 0 0 8px; }
+  .approval pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; background: var(--code); padding: 10px; }
+  .approval-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .approval button[aria-pressed="true"] { border-color: var(--accent); background: var(--user); }
+  .submit-decisions { margin-top: 10px; }
 </style>
 </head>
 <body>
 <header>
   <div class="titles">
     <h1>Operations Assistant</h1>
-    <p>Public demo · read-only · no sign-in</p>
+    <p>Public demo · no sign-in · changes require your approval</p>
+    <p id="agent-label">{{AGENT_LABEL}}</p>
   </div>
   <button type="button" id="new-chat">New chat</button>
 </header>
@@ -91,7 +98,7 @@
   <div class="column" id="log" aria-live="polite">
     <section id="intro">
       <h2>Ask about incidents, SLAs and the product manuals</h2>
-      <p>Answers come from the team's knowledge base and a demo incident database. This assistant can look things up but can't change anything.</p>
+      <p>Ask questions, generate incident reports, or propose changes to the demo incident database and knowledge base. Review and approve each proposed change before it runs.</p>
       <div class="suggestions">
         <button type="button" data-q="What is the response SLA for a P1 incident, and who is it escalated to?">What is the response SLA for a P1 incident?</button>
         <button type="button" data-q="Which incidents are still open, and which department owns each one?">Which incidents are still open?</button>

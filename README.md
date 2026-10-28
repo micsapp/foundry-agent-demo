@@ -5,7 +5,7 @@ An end-to-end demo project showcasing how a **Microsoft (Azure) AI Foundry Agent
 2. **Query & Update an Oracle Database** using custom **Function Tools** (`python-oracledb` with a built-in SQLite mock fallback for instant local testing), or as **MCP tools** on an Azure Function so they also work in the Foundry portal playground.
 3. **Update Knowledge Base Source Files** (`knowledge_base/*.md`, or the same files in Azure Storage) and re-sync the Vector Store.
 4. **Enforce Multi-Layer Guardrails & Human-in-the-Loop (HITL) Approval** on every agent action.
-5. **Offer a Public Chat Page** (no sign-in) for a read-only version of the agent, with per-visitor and daily limits (section 7).
+5. **Offer a Public Chat Page** (no sign-in) for a selected agent version, with explicit approval of changes and per-visitor and daily limits (section 7).
 6. **Load Agent Skills and Execute Packaged Scripts** on the same Azure Function, including an incident-report skill (section 8). The Foundry playground and public chat page work without a VM or a running Streamlit app.
 
 ---
@@ -73,12 +73,20 @@ The script stores the server's `mcp_extension` key in four Foundry project conne
 The sidebar's guardrail switches only change the app: the function always enforces read-only SQL and the table and column allowlist. Switching off approval for DB writes or KB updates makes the app approve Foundry's requests itself; the playground still asks.
 
 ### 7. Public Chat Page (no sign-in)
-The Function App also serves a chat page at `https://agent-tools-<suffix>.azurewebsites.net/api/chat` that anyone can open without signing in (Foundry's own preview link needs an Azure sign-in). The deploy script prints the address. The page talks to a second agent, `Oracle-And-KB-Public-Agent`, which the deploy script, the app and `kb_eval.py` create next to the main one. It has only read-only tools: File Search, `query_oracle_db`, `log_feedback` and the packaged skill tools. None of them needs an approval, and a request to change something gets a "this demo is read-only" answer. The function calls Foundry as its own identity, so visitors spend your subscription's credit. These app settings cap that:
+The Function App also serves a chat page at `https://agent-tools-<suffix>.azurewebsites.net/api/chat` that anyone can open without signing in (Foundry's own preview link needs an Azure sign-in). Function App settings `PUBLIC_CHAT_AGENT` and optional `PUBLIC_CHAT_AGENT_VERSION` select the agent and pin its version. The header shows the selected target. By default, a first deployment selects the separate read-only `Oracle-And-KB-Public-Agent`; to expose the full main agent at version 13, deploy with:
+
+```bash
+PUBLIC_CHAT_AGENT=Oracle-And-KB-Guarded-Agent PUBLIC_CHAT_AGENT_VERSION=13 ./deploy_mcp_tools.sh
+```
+
+The script keeps the selected target on later deployments. The full agent can query incidents, search the KB, run skills, and propose database and KB updates. Each write pauses for review: visitors see the proposed tool arguments, choose **Approve** or **Reject** for every action, then select **Submit decisions**. Only those explicit decisions are sent to Foundry; typing "approve" in chat doesn't execute a pending action. Anyone with the public link can approve changes to the shared demo data. The tool server still validates database writes and KB content. The separate read-only agent remains available in Foundry.
+
+The function calls Foundry as its own identity, so visitors spend your subscription's credit. These app settings cap that:
 - `CHAT_PER_VISITOR_PER_HOUR` (default 20): requests per visitor (client IP, stored only as a salted hash) per hour.
 - `CHAT_DAILY_LIMIT` (default 100): agent replies per UTC day, for all visitors together.
 - `CHAT_MAX_MESSAGE_CHARS` (default 1000).
 
-`./az_tui.sh` → 10 → 8 shows them with today's use and the last 7 days, and → 9 changes one; or use `az functionapp config appsettings set -n agent-tools-<suffix> -g <group> --settings CHAT_DAILY_LIMIT=200`. Re-running the deploy script keeps your values. The counters live in the `publicchat` table. The page keeps its conversation in the browser tab, and the function continues only conversations the page created. The full agent, with approvals, stays behind a sign-in (the Streamlit app, the portal playground or Foundry's preview link). Foundry's preview link (agent → Publish) names an agent version in its address (`?version=12`), so it keeps using that version; after the app or the deploy script creates a new one, publish it in the portal (**Publish Updates**) and use the link it gives. The public page always uses the public agent's latest version.
+`./az_tui.sh` → 10 → 8 shows them with today's use and the last 7 days, and → 9 changes one; or use `az functionapp config appsettings set -n agent-tools-<suffix> -g <group> --settings CHAT_DAILY_LIMIT=200`. Re-running the deploy script keeps your values. The counters and atomic approval-submission records live in the `publicchat` table. Each model request, including an approval continuation, counts toward the daily limit. The page keeps its conversation and a random session token in the browser tab. Conversation metadata binds it to that session and the configured agent/version; the backend accepts decisions only for its recorded pending response and prevents duplicate submissions across Function instances. Reloading preserves pending review cards; **New chat** starts a fresh session. Foundry's preview link (agent → Publish) names an agent version in its address (`?version=12`); after creating a new version, publish it in the portal (**Publish Updates**) and use the new link. The public page follows the selected agent's latest version only when `PUBLIC_CHAT_AGENT_VERSION` is empty.
 
 `./az_tui.sh` → 11 (Cost & Credits) shows this month's cost by service, resource group or resource, daily cost, the free-credit balance and expiry, and invoices, and manages monthly budget alerts.
 

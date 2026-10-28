@@ -1,5 +1,6 @@
 """
-The public chat page's backend: anyone can chat with the read-only agent PUBLIC_CHAT_AGENT without signing in.
+The public chat page's backend: anyone can chat with PUBLIC_CHAT_AGENT without signing in.
+PUBLIC_CHAT_AGENT_VERSION optionally pins an immutable agent version.
 
 The function calls Foundry as its own managed identity (Foundry User role), so every visitor's message is billed
 to this subscription. Limits, each an app setting:
@@ -9,9 +10,10 @@ to this subscription. Limits, each an app setting:
 - CHAT_MAX_MESSAGE_CHARS (default 1000): longest message accepted.
 The counters live in the Azure Table "publicchat" next to the feedback table.
 
-The agent's tools (File Search, query_oracle_db, log_feedback and packaged read-only skills) need no approval; if Foundry asks for one anyway,
-it's refused. Conversations made here carry the metadata source=public-chat and only those are continued, so a
-visitor can't reach any other conversation in the project.
+Write tools pause for a visitor's explicit approval. Decisions are accepted only for the
+server-recorded pending response in that visitor's conversation, once per response.
+An anonymous browser token binds conversations to a session; the salted IP is used only
+for rate limits. Neither agent selection nor tool arguments come from the browser.
 """
 
 from __future__ import annotations
@@ -26,12 +28,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 CONVERSATION_SOURCE = {"source": "public-chat"}
 CONVERSATION_ID = re.compile(r"^conv_[A-Za-z0-9]{8,128}$")
+SESSION_TOKEN = re.compile(r"^[a-f0-9]{64}$")
 LIMITS_TABLE = "publicchat"
-MAX_APPROVAL_ROUNDS = 3  # an approval request shouldn't happen at all; stop refusing after this many
 TOOL_LABELS = {
     "query_oracle_db": "database", "log_feedback": "feedback",
     "list_skills": "skills", "load_skill": "skills", "read_skill_resource": "skills",
     "run_skill_script": "incident report",
+    "update_oracle_incident": "incident update", "propose_kb_file_update": "knowledge base update",
 }  # file_search_call -> knowledge_base
 
 
@@ -87,6 +90,25 @@ class RateLimiter:
                 continue  # changed meanwhile; read it again
         return False  # heavy contention: refuse rather than count wrongly
 
+    def claim_approval(self, conversation_id: str, response_id: str) -> bool:
+        """Atomically prevent the same approval round being submitted twice across instances."""
+        from azure.core.exceptions import ResourceExistsError
+
+        try:
+            self.table.create_entity({
+                "PartitionKey": f"approval-{conversation_id}", "RowKey": response_id,
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            })
+            return True
+        except ResourceExistsError:
+            return False
+
+
+class ChatRequestError(ValueError):
+    def __init__(self, status: int, message: str) -> None:
+        self.status = status
+        super().__init__(message)
+
 
 class PublicChat:
     """Handles one POST from the page. Takes the clients as factories so tests can pass fakes."""
@@ -129,18 +151,63 @@ class PublicChat:
         if not isinstance(data, dict):
             return 400, {"error": "Send JSON with a message."}
         message = data.get("message")
-        max_chars = _setting("CHAT_MAX_MESSAGE_CHARS", 1000)
-        if not isinstance(message, str) or not message.strip():
-            return 400, {"error": "Type a message first."}
-        if len(message) > max_chars:
-            return 400, {"error": f"Please keep messages under {max_chars} characters."}
+        decisions = data.get("approvals")
+        is_decision = "approvals" in data
+        if is_decision:
+            if not isinstance(decisions, list) or not decisions or len(decisions) > 20 or "message" in data:
+                return 400, {"error": "Send approval decisions for the pending actions."}
+            if any(not isinstance(d, dict) or not isinstance(d.get("approval_request_id"), str)
+                   or type(d.get("approve")) is not bool for d in decisions):
+                return 400, {"error": "Each decision needs an approval_request_id and a boolean approve value."}
+        else:
+            max_chars = _setting("CHAT_MAX_MESSAGE_CHARS", 1000)
+            if not isinstance(message, str) or not message.strip():
+                return 400, {"error": "Type a message first."}
+            if len(message) > max_chars:
+                return 400, {"error": f"Please keep messages under {max_chars} characters."}
 
-        if not self.limiter.take(f"day-{now:%Y%m%d}", "all", _setting("CHAT_DAILY_LIMIT", 100)):
-            return 429, {"error": "This demo has reached its message limit for today. Please try again tomorrow."}
+        token = data.get("session_token")
+        if not isinstance(token, str) or SESSION_TOKEN.fullmatch(token) is None:
+            return 400, {"error": "Please reload the page to start a chat session."}
+        owner = hashlib.sha256(f"{salt}|session|{token}".encode()).hexdigest()
+        version = os.environ.get("PUBLIC_CHAT_AGENT_VERSION", "").strip()
 
         try:
-            conversation_id, new_conversation = self._conversation(data.get("conversation_id"))
-            reply, tools, usage = self._run_turn(agent, conversation_id, message.strip())
+            conversation_id, new_conversation, metadata = self._conversation(
+                data.get("conversation_id"), owner, agent, version, is_decision,
+            )
+            pending_response = metadata.get("pending_response", "")
+            if is_decision:
+                if not pending_response:
+                    raise ChatRequestError(409, "There are no pending actions. This decision may already have been submitted.")
+                previous = self.openai.responses.retrieve(pending_response)
+                pending_ids = {item.id for item in previous.output if item.type == "mcp_approval_request"}
+                decision_ids = [d["approval_request_id"] for d in decisions]
+                if not pending_ids or len(decision_ids) != len(pending_ids) or set(decision_ids) != pending_ids:
+                    raise ChatRequestError(400, "Review and decide on every pending action before submitting.")
+                items = [
+                    {"type": "mcp_approval_response", "approval_request_id": d["approval_request_id"], "approve": d["approve"]}
+                    for d in decisions
+                ]
+            elif pending_response:
+                # Recover pending cards after a reload/network failure without sending another model request.
+                response = self.openai.responses.retrieve(pending_response)
+                return 200, self._payload(response, conversation_id, new_conversation, agent, version)
+            else:
+                items = [{"type": "message", "role": "user", "content": message.strip()}]
+
+            if not self.limiter.take(f"day-{now:%Y%m%d}", "all", _setting("CHAT_DAILY_LIMIT", 100)):
+                return 429, {"error": "This demo has reached its message limit for today. Please try again tomorrow."}
+            if is_decision and not self.limiter.claim_approval(conversation_id, pending_response):
+                raise ChatRequestError(409, "These decisions have already been submitted. Start a new chat if the reply was lost.")
+            response = self._run_turn(agent, version, conversation_id, items)
+            metadata["pending_response"] = response.id if any(
+                item.type == "mcp_approval_request" for item in response.output
+            ) else ""
+            self.openai.conversations.update(conversation_id, metadata=metadata)
+            payload = self._payload(response, conversation_id, new_conversation, agent, version)
+        except ChatRequestError as exc:
+            return exc.status, {"error": str(exc)}
         except Exception as exc:
             logging.exception("public chat turn failed")
             if getattr(exc, "status_code", None) == 429:
@@ -148,55 +215,62 @@ class PublicChat:
             return 502, {"error": "The assistant couldn't answer just now. Please try again."}
         logging.info(
             "public chat: visitor %s, conversation %s, tools %s, tokens %s",
-            visitor[:8], conversation_id[-8:], tools or "-", usage,
+            visitor[:8], conversation_id[-8:], payload["tools"] or "-", response.usage,
         )
-        return 200, {
-            "conversation_id": conversation_id,
-            "new_conversation": new_conversation,
-            "reply": reply,
-            "tools": tools,
-        }
+        return 200, payload
 
-    def _conversation(self, requested: Any) -> Tuple[str, bool]:
-        """Continues `requested` if this page created it; otherwise starts a new conversation."""
-        if isinstance(requested, str) and CONVERSATION_ID.match(requested):
+    def _conversation(
+        self, requested: Any, owner: str, agent: str, version: str, must_exist: bool,
+    ) -> Tuple[str, bool, Dict[str, str]]:
+        """Continue only this browser's conversation with this agent and version."""
+        expected = {**CONVERSATION_SOURCE, "owner": owner, "agent": agent, "agent_version": version}
+        if isinstance(requested, str) and CONVERSATION_ID.fullmatch(requested):
             try:
                 conversation = self.openai.conversations.retrieve(requested)
-                if (conversation.metadata or {}).get("source") == CONVERSATION_SOURCE["source"]:
-                    return conversation.id, False
+                metadata = conversation.metadata or {}
+                if all(metadata.get(key) == value for key, value in expected.items()):
+                    return conversation.id, False, dict(metadata)
             except Exception as exc:  # gone, or not reachable as this identity
                 logging.info("public chat: not continuing %s: %s", requested[-8:], type(exc).__name__)
-        return self.openai.conversations.create(metadata=CONVERSATION_SOURCE).id, bool(requested)
+        if must_exist:
+            raise ChatRequestError(403, "This approval doesn't belong to this chat session. Start a new chat.")
+        return self.openai.conversations.create(metadata=expected).id, bool(requested), expected
 
-    def _run_turn(self, agent: str, conversation_id: str, message: str) -> Tuple[str, List[str], Dict[str, int]]:
-        agent_ref = {"agent_reference": {"name": agent, "type": "agent_reference"}}
-        response = self.openai.responses.create(
+    def _run_turn(self, agent: str, version: str, conversation_id: str, items: List[Dict[str, Any]]) -> Any:
+        reference = {"name": agent, "type": "agent_reference"}
+        if version:
+            reference["version"] = version
+        return self.openai.responses.create(
             conversation=conversation_id,
-            input=[{"type": "message", "role": "user", "content": message}],
-            extra_body=agent_ref,
+            input=items,
+            extra_body={"agent_reference": reference},
         )
+
+    @staticmethod
+    def _payload(response: Any, conversation_id: str, new_conversation: bool, agent: str, version: str) -> Dict[str, Any]:
         tools: List[str] = []
-        usage = {"input": 0, "output": 0}
-        for round_no in range(MAX_APPROVAL_ROUNDS + 1):
-            for item in response.output:
-                label = "knowledge_base" if item.type == "file_search_call" else (
-                    TOOL_LABELS.get(getattr(item, "name", "")) if item.type == "mcp_call" else None
-                )
-                if label and label not in tools:
-                    tools.append(label)
-            if response.usage:
-                usage["input"] += response.usage.input_tokens or 0
-                usage["output"] += response.usage.output_tokens or 0
-            refusals = [
-                {"type": "mcp_approval_response", "approval_request_id": item.id, "approve": False}
-                for item in response.output
-                if item.type == "mcp_approval_request"
-            ]
-            if not refusals or round_no == MAX_APPROVAL_ROUNDS:
-                break
-            logging.warning("public chat: refused %d approval request(s)", len(refusals))
-            response = self.openai.responses.create(conversation=conversation_id, input=refusals, extra_body=agent_ref)
-        return response.output_text or "Sorry, I don't have an answer for that.", tools, usage
+        approvals = []
+        for item in response.output:
+            label = "knowledge_base" if item.type == "file_search_call" else (
+                TOOL_LABELS.get(getattr(item, "name", "")) if item.type == "mcp_call" else None
+            )
+            if label and label not in tools:
+                tools.append(label)
+            if item.type == "mcp_approval_request":
+                try:
+                    arguments = json.loads(item.arguments)
+                except (ValueError, TypeError):
+                    arguments = item.arguments
+                approvals.append({"id": item.id, "tool": item.name, "arguments": arguments})
+        return {
+            "conversation_id": conversation_id, "new_conversation": new_conversation,
+            "agent": {"name": agent, "version": version or "latest"},
+            "reply": response.output_text or (
+                "Review the proposed changes below. They will run only if you approve them."
+                if approvals else "Sorry, I don't have an answer for that."
+            ),
+            "tools": tools, "approvals": approvals,
+        }
 
 
 def default_chat() -> PublicChat:

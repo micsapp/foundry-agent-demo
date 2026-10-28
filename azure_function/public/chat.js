@@ -2,11 +2,15 @@
 // The conversation and transcript live in sessionStorage, so a reload keeps the chat and a new tab starts fresh.
 "use strict";
 (() => {
-  const STORAGE_KEY = "public-chat-v1";
+  const STORAGE_KEY = "public-chat-v2";
   const TOOL_TEXT = {
     knowledge_base: "Searched the knowledge base",
     database: "Queried the database",
     feedback: "Logged for the team",
+    skills: "Loaded an agent skill",
+    "incident report": "Generated an incident report",
+    "incident update": "Ran the incident update tool",
+    "knowledge base update": "Ran the knowledge base update tool",
   };
   const log = document.getElementById("log");
   const intro = document.getElementById("intro");
@@ -29,9 +33,14 @@
   function load() {
     try {
       const saved = JSON.parse(sessionStorage.getItem(STORAGE_KEY));
-      if (saved && Array.isArray(saved.messages)) return saved;
+      if (saved && Array.isArray(saved.messages) && /^[a-f0-9]{64}$/.test(saved.sessionToken)) return saved;
     } catch (e) { /* storage blocked or corrupt: start fresh */ }
-    return { conversationId: null, messages: [] };
+    return freshState();
+  }
+
+  function freshState() {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return { conversationId: null, messages: [], sessionToken: Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("") };
   }
 
   function save() {
@@ -65,8 +74,69 @@
       }
       el.appendChild(tools);
     }
+    if (msg.approvals && msg.approvals.length) addApprovals(msg, el);
     log.appendChild(el);
     scrollToEnd();
+  }
+
+  function addApprovals(msg, el) {
+    msg.decisions = msg.decisions || {};
+    const controls = [];
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.className = "submit-decisions";
+    submit.textContent = msg.submitted ? "Decisions submitted" : "Submit decisions";
+    submit.dataset.approvalSubmit = "true";
+    for (const action of msg.approvals) {
+      const card = document.createElement("section");
+      card.className = "approval";
+      const title = document.createElement("h3");
+      title.textContent = action.tool === "update_oracle_incident" ? "Proposed incident update" :
+        action.tool === "propose_kb_file_update" ? "Proposed knowledge base update" : "Proposed action: " + action.tool;
+      const content = document.createElement("pre");
+      content.textContent = typeof action.arguments === "string" ? action.arguments : JSON.stringify(action.arguments, null, 2);
+      card.append(title, content);
+      const buttons = document.createElement("div");
+      buttons.className = "approval-actions";
+      for (const [label, approve] of [["Approve", true], ["Reject", false]]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = label;
+        button.dataset.approvalButton = "true";
+        button.addEventListener("click", () => {
+          msg.decisions[action.id] = approve;
+          save();
+          refresh();
+        });
+        controls.push({ button, id: action.id, approve });
+        buttons.appendChild(button);
+      }
+      card.appendChild(buttons);
+      el.appendChild(card);
+    }
+    function refresh() {
+      for (const control of controls) {
+        control.button.setAttribute("aria-pressed", String(msg.decisions[control.id] === control.approve));
+        control.button.disabled = busy || Boolean(msg.submitted);
+      }
+      submit.disabled = busy || Boolean(msg.submitted) || msg.approvals.some(a => typeof msg.decisions[a.id] !== "boolean");
+      submit.textContent = msg.submitted ? "Decisions submitted" : "Submit decisions";
+    }
+    submit.addEventListener("click", () => request({
+      approvals: msg.approvals.map(a => ({ approval_request_id: a.id, approve: msg.decisions[a.id] })),
+    }, msg));
+    el.appendChild(submit);
+    msg.refreshApprovals = refresh;
+    refresh();
+  }
+
+  function updateControls() {
+    const pending = state.messages.some(msg => msg.approvals && msg.approvals.length && !msg.submitted);
+    send.disabled = busy || pending;
+    input.disabled = busy || pending;
+    input.placeholder = pending ? "Review the proposed changes above first…" : "Ask a question…";
+    document.getElementById("new-chat").disabled = busy;
+    for (const msg of state.messages) if (msg.refreshApprovals) msg.refreshApprovals();
   }
 
   function addNote(text, kind) {
@@ -90,19 +160,24 @@
   }
 
   async function ask(text) {
-    if (busy || !text.trim()) return;
-    busy = true;
-    send.disabled = true;
+    if (busy || input.disabled || !text.trim()) return;
     const question = { role: "user", text: text.trim() };
     state.messages.push(question);
     save();
     addMessage(question);
+    await request({ message: question.text });
+  }
+
+  async function request(payload, approvalMessage) {
+    if (busy) return;
+    busy = true;
+    updateControls();
     const stopThinking = addThinking();
     try {
       const res = await fetch("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: question.text, conversation_id: state.conversationId }),
+        body: JSON.stringify({ ...payload, conversation_id: state.conversationId, session_token: state.sessionToken }),
       });
       let data = {};
       try { data = await res.json(); } catch (e) { /* not JSON */ }
@@ -113,7 +188,11 @@
       }
       if (data.new_conversation) addNote("Your earlier chat had expired, so this started a new one.", "info");
       state.conversationId = data.conversation_id;
-      const answer = { role: "assistant", text: data.reply, tools: data.tools || [] };
+      if (approvalMessage) {
+        approvalMessage.submitted = true;
+        approvalMessage.refreshApprovals();
+      }
+      const answer = { role: "assistant", text: data.reply, tools: data.tools || [], approvals: data.approvals || [] };
       state.messages.push(answer);
       save();
       addMessage(answer);
@@ -122,7 +201,7 @@
       addNote("Couldn't reach the assistant. Check your connection and try again.", "error");
     } finally {
       busy = false;
-      send.disabled = false;
+      updateControls();
       input.focus();
     }
   }
@@ -152,12 +231,14 @@
   }
   document.getElementById("new-chat").addEventListener("click", () => {
     if (busy) return;
-    state = { conversationId: null, messages: [] };
+    state = freshState();
     save();
     for (const el of [...log.children]) if (el !== intro) el.remove();
     intro.hidden = false;
+    updateControls();
     input.focus();
   });
 
   for (const msg of state.messages) addMessage(msg);
+  updateControls();
 })();

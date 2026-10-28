@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploys the Azure Function that serves the agent's log_feedback, query_oracle_db, update_oracle_incident and
 # propose_kb_file_update and packaged skill tools as an MCP server, which Foundry calls itself (so they also work in the Foundry
-# portal playground), and a public chat page (no sign-in) for a read-only agent. Safe to re-run: existing
+# portal playground), and a public chat page (no sign-in) with explicit approvals for write tools. Safe to re-run: existing
 # resources are reused and the code is redeployed.
 #
 #   1. Storage account in the Foundry resource's group and region, with the Azure Table "feedback", the blob
@@ -21,7 +21,8 @@
 #      FEEDBACK_TABLE_NAME, DB_MODE=azure_blob, ORACLE_MOCK_BLOB_URL, KB_MODE=azure_blob and KB_BLOB_CONTAINER_URL
 #      in .env
 #   8. Creates or reuses the agent versions, as an app start does: the main agent and the public chat page's
-#      read-only agent (File Search, query_oracle_db, log_feedback and packaged skills). Then checks /api/chat
+#      read-only agent (File Search, query_oracle_db, log_feedback and packaged skills). The page can also target
+#      a pinned version of the main agent with PUBLIC_CHAT_AGENT and PUBLIC_CHAT_AGENT_VERSION. Then checks /api/chat
 #   9. Removes what earlier versions of this script deployed: the Function App feedback-log-<suffix> (with its
 #      role assignments, Application Insights, plan and package container) and the connection feedback-mcp
 #
@@ -141,14 +142,23 @@ if ! az functionapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
     --runtime python --runtime-version 3.13 --instance-memory 512 --maximum-instance-count 10 -o none
 fi
 APP_PRINCIPAL=$(az functionapp identity assign -n "$APP" -g "$RG" --query principalId -o tsv)
-PUBLIC_AGENT=$("$PY" -c 'from agent_service import PUBLIC_AGENT_NAME; print(PUBLIC_AGENT_NAME)')
+# Keep the selected public agent/version on redeploy; shell overrides select a new target.
+PUBLIC_AGENT=${PUBLIC_CHAT_AGENT:-$(az functionapp config appsettings list -n "$APP" -g "$RG" \
+  --query "[?name=='PUBLIC_CHAT_AGENT'].value | [0]" -o tsv)}
+if [[ -z $PUBLIC_AGENT || $PUBLIC_AGENT == None ]]; then
+  PUBLIC_AGENT=$("$PY" -c 'from agent_service import PUBLIC_AGENT_NAME; print(PUBLIC_AGENT_NAME)')
+fi
+PUBLIC_VERSION=${PUBLIC_CHAT_AGENT_VERSION-$(az functionapp config appsettings list -n "$APP" -g "$RG" \
+  --query "[?name=='PUBLIC_CHAT_AGENT_VERSION'].value | [0]" -o tsv)}
+[[ $PUBLIC_VERSION != None ]] || PUBLIC_VERSION=""
 # Salt for the chat page's visitor hashes; kept across re-runs so the hourly counts carry on
 SALT=$(az functionapp config appsettings list -n "$APP" -g "$RG" --query "[?name=='CHAT_VISITOR_SALT'].value | [0]" -o tsv)
 [[ -n $SALT ]] || SALT=$(openssl rand -hex 16)
 az functionapp config appsettings set -n "$APP" -g "$RG" -o none --settings \
   "FEEDBACK_TABLE_ENDPOINT=https://$STORAGE.table.core.windows.net" "FEEDBACK_TABLE_NAME=$TABLE" \
   "ORACLE_MOCK_BLOB_URL=$DB_BLOB_URL" "KB_BLOB_CONTAINER_URL=$KB_CONTAINER_URL" "PROJECT_ENDPOINT=$ENDPOINT" \
-  "PUBLIC_CHAT_AGENT=$PUBLIC_AGENT" "CHAT_VISITOR_SALT=$SALT"
+  "PUBLIC_CHAT_AGENT=$PUBLIC_AGENT" "PUBLIC_CHAT_AGENT_VERSION=$PUBLIC_VERSION" "CHAT_VISITOR_SALT=$SALT"
+echo "Public chat target: $PUBLIC_AGENT (${PUBLIC_VERSION:+version }${PUBLIC_VERSION:-latest version})"
 read -r APP_ID HOST < <(az functionapp show -n "$APP" -g "$RG" \
   --query "join(' ', [id, properties.defaultHostName || defaultHostName])" -o tsv)
 
@@ -313,7 +323,7 @@ from agent_service import FoundryAgentOrchestrator
 orch = FoundryAgentOrchestrator(agent_mode="foundry", db_mode=os.getenv("DB_MODE", "sqlite_mock"))
 if not orch.foundry_agent_name or orch.public_agent_status.startswith(("failed", "not created")):
     sys.exit(f"Couldn't set up the agents: {orch.foundry_status}")
-print(f"Agent {orch.foundry_agent_name} v{orch.foundry_agent_version}; public chat agent {orch.public_agent_status}")
+print(f"Agent {orch.foundry_agent_name} v{orch.foundry_agent_version}; read-only companion agent {orch.public_agent_status}")
 EOF
 CHAT_URL="https://$HOST/api/chat"
 PAGE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$CHAT_URL")

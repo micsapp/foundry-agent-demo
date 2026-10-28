@@ -30,6 +30,7 @@ build_id.txt so the script can tell when the new code is live (GET /api/health r
 import json
 import logging
 import os
+from html import escape
 from pathlib import Path
 
 import azure.functions as func
@@ -206,7 +207,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Public chat page (no sign-in) for the read-only agent; limits and safeguards are described in public_chat.py
+# Public chat page (no sign-in); agent selection, limits and approvals are described in public_chat.py
 # ----------------------------------------------------------------------------------------------------------------
 _PUBLIC_DIR = Path(__file__).with_name("public")
 _chat = default_chat()
@@ -222,8 +223,12 @@ _PAGE_HEADERS = {
 
 @app.route(route="chat", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def chat_page(req: func.HttpRequest) -> func.HttpResponse:
+    agent = os.environ.get("PUBLIC_CHAT_AGENT", "Operations Assistant")
+    version = os.environ.get("PUBLIC_CHAT_AGENT_VERSION", "").strip()
+    label = f"{agent} · v{version}" if version else agent
+    page = (_PUBLIC_DIR / "chat.html").read_text(encoding="utf-8").replace("{{AGENT_LABEL}}", escape(label))
     return func.HttpResponse(
-        (_PUBLIC_DIR / "chat.html").read_bytes(), mimetype="text/html", charset="utf-8", headers=_PAGE_HEADERS
+        page, mimetype="text/html", charset="utf-8", headers={**_PAGE_HEADERS, "Cache-Control": "no-store"}
     )
 
 
@@ -231,7 +236,7 @@ def chat_page(req: func.HttpRequest) -> func.HttpResponse:
 def chat_script(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         (_PUBLIC_DIR / "chat.js").read_bytes(), mimetype="text/javascript", charset="utf-8",
-        headers={"X-Content-Type-Options": "nosniff"},
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-cache"},
     )
 
 
